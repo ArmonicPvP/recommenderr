@@ -1,0 +1,214 @@
+# app/pipeline.py
+import math
+import time
+import logging
+import datetime as dt
+import pandas as pd
+from .db import engine, ensure_schema
+from .plex import iter_history, fetch_metadata, list_sections, iter_library_items, list_home_users
+from .features import build_item_matrix
+
+log = logging.getLogger(__name__)
+
+def _ts_to_iso_utc(ts):
+    if ts is None:
+        return None
+    try:
+        sec = int(str(ts))
+        return dt.datetime.utcfromtimestamp(sec).replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return str(ts)
+
+def _preference(grp: pd.DataFrame) -> float:
+    events = len(grp)
+    started = pd.to_datetime(grp["started_at"], utc=True, errors="coerce")
+    last_seen = started.max()
+    days = 999.0 if pd.isna(last_seen) else (pd.Timestamp.utcnow() - last_seen).days
+    recent = math.exp(-days / 90.0)
+    dur = grp["duration"].dropna()
+    dur_score = min(dur.max() / 1800.0, 1.0) if not dur.empty else 0.5
+    w_amt, w_rec, w_dur, w_bias = 0.55, 0.30, 0.10, 0.05
+    return w_amt * math.log1p(events) + w_rec * recent + w_dur * dur_score + w_bias
+
+def ingest_once():
+    """Sync users and ingest canonical watch history; upsert item metadata."""
+    ensure_schema()
+    t0 = time.time()
+    with engine().begin() as con:
+        # users
+        try:
+            home_map = list_home_users()
+            for uid, payload in home_map.items():
+                uname = (payload.get("username") or "").strip() or None
+                dname = (payload.get("display_name") or "").strip() or None
+                con.exec_driver_sql(
+                    """
+                    INSERT INTO users(user_id, user_name, display_name)
+                    VALUES (:uid, :uname, :dname)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                      user_name=excluded.user_name,
+                      display_name=excluded.display_name
+                    """,
+                    {"uid": uid, "uname": uname, "dname": dname},
+                )
+            log.info("User sync complete: %d users", len(home_map))
+        except Exception as e:
+            log.warning("Could not sync home users: %s", e)
+
+        # history
+        count = 0
+        for row in iter_history():
+            item_id = row.get("item_id")
+            if not item_id:
+                continue
+            uid = str(row.get("user_id") or "")
+            started_iso = _ts_to_iso_utc(row.get("started_at"))
+            stopped_iso = _ts_to_iso_utc(row.get("stopped_at"))
+
+            con.exec_driver_sql(
+                """
+                INSERT INTO watch_events(
+                    user_id, user_name, item_id,
+                    started_at, stopped_at,
+                    duration, view_offset, completed, source
+                )
+                VALUES (:uid, NULL, :iid, :st, :sp, :dur, :off, 1, 'plex')
+                """,
+                {
+                    "uid": uid, "iid": item_id,
+                    "st": started_iso, "sp": stopped_iso,
+                    "dur": row.get("duration") or 0,
+                    "off": row.get("view_offset") or 0,
+                },
+            )
+
+            md = fetch_metadata(item_id)
+            if md:
+                cols = ",".join(md.keys())
+                placeholders = ",".join(":" + k for k in md.keys())
+                sets = ",".join([f"{k}=excluded.{k}" for k in md.keys() if k != "item_id"])
+                con.exec_driver_sql(
+                    f"INSERT INTO items({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT(item_id) DO UPDATE SET {sets}",
+                    md,
+                )
+            count += 1
+    dt_ms = int((time.time() - t0) * 1000)
+    log.info("Ingest complete: %d history rows in %dms", count, dt_ms)
+    return count
+
+def scan_library_all():
+    """Upsert all movies/series from every movie/show section into items."""
+    ensure_schema()
+    t0 = time.time()
+    sections = list_sections()
+    total = 0
+    with engine().begin() as con:
+        for s in sections:
+            kind = s.get("type")
+            if kind not in ("movie", "show"):
+                continue
+            section_key = s["key"]
+            for item_rk in iter_library_items(section_key, kind):
+                md = fetch_metadata(item_rk)
+                if not md:
+                    continue
+                cols = ",".join(md.keys())
+                placeholders = ",".join(":" + k for k in md.keys())
+                sets = ",".join([f"{k}=excluded.{k}" for k in md.keys() if k != "item_id"])
+                con.exec_driver_sql(
+                    f"INSERT INTO items({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT(item_id) DO UPDATE SET {sets}",
+                    md,
+                )
+                total += 1
+    dt_ms = int((time.time() - t0) * 1000)
+    log.info("Library scan complete: %d items updated in %dms", total, dt_ms)
+    return total
+
+def _backfill_missing_items():
+    """Ensure every referenced item exists in items."""
+    filled = 0
+    with engine().begin() as con:
+        missing = con.exec_driver_sql(
+            """
+            WITH refs AS (
+                SELECT DISTINCT item_id FROM user_item_pref
+                UNION
+                SELECT DISTINCT item_id FROM watch_events
+            )
+            SELECT r.item_id
+            FROM refs r
+            LEFT JOIN items i ON i.item_id = r.item_id
+            WHERE i.item_id IS NULL
+            """
+        ).fetchall()
+    missing_ids = [str(r[0]) for r in missing]
+    if not missing_ids:
+        log.debug("Backfill: no missing items")
+        return 0
+    log.info("Backfill: fetching metadata for %d missing items", len(missing_ids))
+    with engine().begin() as con:
+        for iid in missing_ids:
+            md = fetch_metadata(iid)
+            if not md:
+                continue
+            cols = ",".join(md.keys())
+            placeholders = ",".join(":" + k for k in md.keys())
+            sets = ",".join([f"{k}=excluded.{k}" for k in md.keys() if k != "item_id"])
+            con.exec_driver_sql(
+                f"INSERT INTO items({cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT(item_id) DO UPDATE SET {sets}",
+                md,
+            )
+            filled += 1
+    log.info("Backfill: added/updated %d items", filled)
+    return filled
+
+def rebuild_prefs_and_vectors():
+    """Recompute user_item_pref and rebuild item vectors."""
+    with engine().begin() as con:
+        df_we = pd.read_sql_query("SELECT user_id,item_id,started_at,duration FROM watch_events", con)
+        if not df_we.empty:
+            rows = []
+            for (u, i), grp in df_we.groupby(["user_id", "item_id"]):
+                rows.append({
+                    "user_id": u,
+                    "item_id": i,
+                    "preference": _preference(grp),
+                    "last_seen_at": pd.to_datetime(grp["started_at"], utc=True, errors="coerce").max(),
+                })
+            df_pref = pd.DataFrame(rows)
+            df_pref["last_seen_at"] = df_pref["last_seen_at"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            for _, r in df_pref.iterrows():
+                con.exec_driver_sql(
+                    """
+                    INSERT INTO user_item_pref(user_id,item_id,preference,last_seen_at)
+                    VALUES (:u,:i,:p,:t)
+                    ON CONFLICT(user_id,item_id) DO UPDATE SET
+                      preference=excluded.preference,
+                      last_seen_at=excluded.last_seen_at
+                    """,
+                    {"u": r.user_id, "i": r.item_id, "p": float(r.preference), "t": r.last_seen_at},
+                )
+
+        items = pd.read_sql_query(
+            """
+            SELECT item_id, title, summary,
+                   genres_csv, cast_csv, directors_csv,
+                   collections_csv, year
+            FROM items
+            """,
+            con,
+        )
+
+    if items.empty:
+        log.info("Rebuild skipped: no items")
+        return 0
+
+    log.debug("Backfill check…")
+    _backfill_missing_items()
+
+    log.info("Rebuilding vectors for %d items…", len(items))
+    build_item_matrix(items)
+    return len(items)
