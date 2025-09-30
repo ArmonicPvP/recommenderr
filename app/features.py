@@ -66,11 +66,21 @@ def build_item_matrix(items_df: pd.DataFrame):
 
     # weighted stack
     mats, weights = [], []
-    if C.shape[1] > 0 and FEAT_W_COLLECTIONS > 0: mats.append(C); weights.append(FEAT_W_COLLECTIONS)
-    if G.shape[1] > 0 and FEAT_W_GENRES > 0:       mats.append(G); weights.append(FEAT_W_GENRES)
-    if P.shape[1] > 0 and FEAT_W_PEOPLE > 0:       mats.append(P); weights.append(FEAT_W_PEOPLE)
-    if T.shape[1] > 0 and FEAT_W_TEXT > 0:         mats.append(T); weights.append(FEAT_W_TEXT)
-    if Y.shape[1] > 0 and FEAT_W_YEAR > 0:         mats.append(Y); weights.append(FEAT_W_YEAR)
+    if C.shape[1] > 0 and FEAT_W_COLLECTIONS > 0:
+        mats.append(C)
+        weights.append(FEAT_W_COLLECTIONS)
+    if G.shape[1] > 0 and FEAT_W_GENRES > 0:
+        mats.append(G)
+        weights.append(FEAT_W_GENRES)
+    if P.shape[1] > 0 and FEAT_W_PEOPLE > 0:
+        mats.append(P)
+        weights.append(FEAT_W_PEOPLE)
+    if T.shape[1] > 0 and FEAT_W_TEXT > 0:
+        mats.append(T)
+        weights.append(FEAT_W_TEXT)
+    if Y.shape[1] > 0 and FEAT_W_YEAR > 0:
+        mats.append(Y)
+        weights.append(FEAT_W_YEAR)
 
     if not mats:
         raise RuntimeError("No feature matrices produced; check inputs/weights")
