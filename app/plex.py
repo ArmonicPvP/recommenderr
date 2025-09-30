@@ -1,6 +1,7 @@
 # app/plex.py
 import logging
-import httpx, xmltodict
+import httpx
+import xmltodict
 from .config import PLEX_BASE, PLEX_TOKEN
 
 log = logging.getLogger(__name__)
@@ -75,16 +76,21 @@ def fetch_metadata(item_id: str):
 
     def csv_attr(node, key):
         xs = node.get(key)
-        if not xs: return ""
-        if isinstance(xs, list):  return ",".join([x.get("@tag", "") for x in xs if isinstance(x, dict)])
-        if isinstance(xs, dict):  return xs.get("@tag", "")
+        if not xs:
+            return ""
+        if isinstance(xs, list):
+            return ",".join([x.get("@tag", "") for x in xs if isinstance(x, dict)])
+        if isinstance(xs, dict):
+            return xs.get("@tag", "")
         return ""
 
     roles = node.get("Role")
     cast = ""
     if roles:
-        if isinstance(roles, list): cast = ",".join([r.get("@tag", "") for r in roles if isinstance(r, dict)])
-        elif isinstance(roles, dict): cast = roles.get("@tag", "")
+        if isinstance(roles, list):
+            cast = ",".join([r.get("@tag", "") for r in roles if isinstance(r, dict)])
+        elif isinstance(roles, dict):
+            cast = roles.get("@tag", "")
 
     genres = csv_attr(node, "Genre")
     directors = csv_attr(node, "Director")
@@ -125,8 +131,10 @@ def iter_library_items(section_key: str, kind: str):
     xml = _get(f"/library/sections/{section_key}/all")
     mc = xmltodict.parse(xml).get("MediaContainer", {})
     nodes = []
-    if mc.get("Video"):     nodes.extend(mc["Video"] if isinstance(mc["Video"], list) else [mc["Video"]])
-    if mc.get("Directory"): nodes.extend(mc["Directory"] if isinstance(mc["Directory"], list) else [mc["Directory"]])
+    if mc.get("Video"):
+        nodes.extend(mc["Video"] if isinstance(mc["Video"], list) else [mc["Video"]])
+    if mc.get("Directory"):
+        nodes.extend(mc["Directory"] if isinstance(mc["Directory"], list) else [mc["Directory"]])
     if not nodes:
         log.info("Section %s: 0 nodes", section_key)
         return
