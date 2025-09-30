@@ -131,8 +131,10 @@ def iter_library_items(section_key: str, kind: str):
     xml = _get(f"/library/sections/{section_key}/all")
     mc = xmltodict.parse(xml).get("MediaContainer", {})
     nodes = []
-    if mc.get("Video"):     nodes.extend(mc["Video"] if isinstance(mc["Video"], list) else [mc["Video"]])
-    if mc.get("Directory"): nodes.extend(mc["Directory"] if isinstance(mc["Directory"], list) else [mc["Directory"]])
+    if mc.get("Video"):
+        nodes.extend(mc["Video"] if isinstance(mc["Video"], list) else [mc["Video"]])
+    if mc.get("Directory"):
+        nodes.extend(mc["Directory"] if isinstance(mc["Directory"], list) else [mc["Directory"]])
     if not nodes:
         log.info("Section %s: 0 nodes", section_key)
         return
