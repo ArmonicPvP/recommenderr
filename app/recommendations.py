@@ -327,7 +327,10 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
                 pct_contrib = (c / (total + eps)) * 100.0 if total > 0 else 0.0
                 expl[name] = {"contribution": round(c, 6), "percent_of_score": round(pct_contrib, 2)}
             if r.item_id in boosted_set:
-                expl["collections_rerank_boost"] = {"contribution": REC_COLLECTION_BOOST, "percent_of_score": None}
+                base = sc_map[r.item_id]
+                total_after = base + REC_COLLECTION_BOOST
+                pct_boost = (REC_COLLECTION_BOOST / max(total_after, 1e-12)) * 100.0
+                expl["collections_rerank_boost"] = {"contribution": REC_COLLECTION_BOOST, "percent_of_score": round(pct_boost, 2)}
             rec["explain"] = expl
 
         results.append(rec)
