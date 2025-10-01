@@ -1,4 +1,3 @@
-# app/db.py
 import logging
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -43,6 +42,32 @@ def ensure_schema():
         # Allow multiple managed/guest entries with empty username
         try:
             con.exec_driver_sql("UPDATE users SET user_name = NULL WHERE user_name = ''")
+        except Exception:
+            pass
+
+        # feature columns on items (used by the vectorizer)
+        item_migrations = [
+            ("content_rating", "ALTER TABLE items ADD COLUMN content_rating TEXT"),
+            ("countries_csv", "ALTER TABLE items ADD COLUMN countries_csv TEXT"),
+            ("keywords_csv",  "ALTER TABLE items ADD COLUMN keywords_csv TEXT"),
+            ("tmdb_id",       "ALTER TABLE items ADD COLUMN tmdb_id TEXT"),
+        ]
+        for col, ddl in item_migrations:
+            if not _column_exists(con, "items", col):
+                log.info("Migrating: add items.%s", col)
+                con.exec_driver_sql(ddl)
+
+        # Helpful indexes (idempotent; ignore errors if present)
+        try:
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_items_year ON items(year)"
+            )
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_items_tmdb ON items(tmdb_id)"
+            )
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_pref_user ON user_item_pref(user_id)"
+            )
         except Exception:
             pass
 

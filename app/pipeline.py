@@ -1,4 +1,3 @@
-# app/pipeline.py
 import math
 import time
 import logging
@@ -7,6 +6,37 @@ import pandas as pd
 from .db import engine, ensure_schema
 from .plex import iter_history, fetch_metadata, list_sections, iter_library_items, list_home_users
 from .features import build_item_matrix
+from .tmdb import fetch_keywords_for_movie
+
+def _enrich_keywords_if_possible():
+    from .config import TMDB_API_KEY
+    if not TMDB_API_KEY:
+        return 0
+    added = 0
+    with engine().begin() as con:
+        rows = con.exec_driver_sql(
+            """
+            SELECT item_id, tmdb_id FROM items
+            WHERE (tmdb_id IS NOT NULL AND tmdb_id != '')
+              AND (keywords_csv IS NULL OR keywords_csv = '')
+            LIMIT 300
+            """
+        ).fetchall()
+    for item_id, tmdb_id in rows:
+        kw = fetch_keywords_for_movie(str(tmdb_id))
+        if kw:
+            csv = ",".join(sorted(set(kw)))
+            with engine().begin() as con:
+                con.exec_driver_sql(
+                    "UPDATE items SET keywords_csv=:csv WHERE item_id=:iid",
+                    {"csv": csv, "iid": str(item_id)}
+                )
+            added += 1
+        time.sleep(0.02)  # ~50 rps max
+    if added:
+        log.info("TMDB keywords enriched for %d items", added)
+    return added
+
 
 log = logging.getLogger(__name__)
 
@@ -35,12 +65,18 @@ def ingest_once():
     ensure_schema()
     t0 = time.time()
     with engine().begin() as con:
-        # users
+        # 1) Sync users and find admin uid
+        user_map = {}
+        admin_uid = None
         try:
             home_map = list_home_users()
             for uid, payload in home_map.items():
                 uname = (payload.get("username") or "").strip() or None
                 dname = (payload.get("display_name") or "").strip() or None
+                is_admin = bool(payload.get("admin"))
+                if is_admin:
+                    admin_uid = uid
+
                 con.exec_driver_sql(
                     """
                     INSERT INTO users(user_id, user_name, display_name)
@@ -51,17 +87,36 @@ def ingest_once():
                     """,
                     {"uid": uid, "uname": uname, "dname": dname},
                 )
-            log.info("User sync complete: %d users", len(home_map))
+                user_map[uid] = {"username": uname, "display_name": dname, "admin": is_admin}
+            log.info("User sync complete: %d users (admin_uid=%s)", len(home_map), admin_uid)
         except Exception as e:
             log.warning("Could not sync home users: %s", e)
 
-        # history
+        # 1a) If we know the admin, rewrite any PMS-local rows (user_id='1') to that real uid
+        if admin_uid:
+            updated_we = con.exec_driver_sql(
+                "UPDATE watch_events SET user_id=:admin WHERE user_id='1'", {"admin": admin_uid}
+            ).rowcount
+            updated_pref = con.exec_driver_sql(
+                "UPDATE user_item_pref SET user_id=:admin WHERE user_id='1'", {"admin": admin_uid}
+            ).rowcount
+            if updated_we or updated_pref:
+                log.info("Remapped PMS user_id=1 → %s (we=%d, prefs=%d)", admin_uid, updated_we, updated_pref)
+
+        # 2) Ingest history; also rewrite incoming '1' to admin_uid immediately
         count = 0
         for row in iter_history():
+            raw_uid = str(row.get("user_id") or "")
+            uid = admin_uid if (raw_uid == "1" and admin_uid) else raw_uid
+
             item_id = row.get("item_id")
             if not item_id:
+                log.debug("Skipping history row without item_id: %s", row)
                 continue
-            uid = str(row.get("user_id") or "")
+
+            cached = user_map.get(uid) or {}
+            friendly = cached.get("username") or cached.get("display_name") or None
+
             started_iso = _ts_to_iso_utc(row.get("started_at"))
             stopped_iso = _ts_to_iso_utc(row.get("stopped_at"))
 
@@ -72,11 +127,14 @@ def ingest_once():
                     started_at, stopped_at,
                     duration, view_offset, completed, source
                 )
-                VALUES (:uid, NULL, :iid, :st, :sp, :dur, :off, 1, 'plex')
+                VALUES (:uid, :uname, :iid, :st, :sp, :dur, :off, 1, 'plex')
                 """,
                 {
-                    "uid": uid, "iid": item_id,
-                    "st": started_iso, "sp": stopped_iso,
+                    "uid": uid,
+                    "uname": friendly,
+                    "iid": item_id,
+                    "st": started_iso,
+                    "sp": stopped_iso,
                     "dur": row.get("duration") or 0,
                     "off": row.get("view_offset") or 0,
                 },
@@ -167,7 +225,24 @@ def _backfill_missing_items():
 
 def rebuild_prefs_and_vectors():
     """Recompute user_item_pref and rebuild item vectors."""
+    
+
     with engine().begin() as con:
+        try:
+            _enrich_keywords_if_possible()
+        except Exception as e:
+            log.warning("Keyword enrichment skipped: %s", e)
+        items = pd.read_sql_query(
+            """
+            SELECT item_id, title, summary, year,
+                genres_csv, cast_csv, directors_csv, collections_csv,
+                countries_csv, content_rating, keywords_csv
+            FROM items
+            """,
+            con,
+    )
+
+
         df_we = pd.read_sql_query("SELECT user_id,item_id,started_at,duration FROM watch_events", con)
         if not df_we.empty:
             rows = []

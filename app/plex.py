@@ -1,4 +1,3 @@
-# app/plex.py
 import logging
 import httpx
 import xmltodict
@@ -95,13 +94,26 @@ def fetch_metadata(item_id: str):
     genres = csv_attr(node, "Genre")
     directors = csv_attr(node, "Director")
     collections = csv_attr(node, "Collection")
+    countries = csv_attr(node, "Country")
+    content_rating = node.get("@contentRating")
     thumb = node.get("@thumb")
     poster_url = f"{PLEX_BASE}{thumb}?X-Plex-Token={PLEX_TOKEN}" if thumb else None
     runtime = int(node.get("@duration", 0)) // 1000 if node.get("@duration") else None
     year = node.get("@year")
     year = int(year) if year and str(year).isdigit() else None
 
-    return {
+    tmdb_id = None
+    guids = node.get("Guid")
+    if guids:
+        if isinstance(guids, dict):
+            guids = [guids]
+        for g in guids:
+            gid = g.get("@id") if isinstance(g, dict) else None
+            if gid and gid.startswith("tmdb://"):
+                tmdb_id = gid.split("tmdb://", 1)[1].strip()
+                break
+
+    md = {
         "item_id": str(node.get("@ratingKey") or item_id),
         "type": node.get("@type"),
         "title": node.get("@title"),
@@ -113,7 +125,12 @@ def fetch_metadata(item_id: str):
         "directors_csv": directors,
         "collections_csv": collections,
         "poster_url": poster_url,
+        "countries_csv": countries or "",
+        "content_rating": content_rating or "",
+        "tmdb_id": tmdb_id or ""
     }
+    log.debug("Fetched metadata: %s", {"item_id": md["item_id"], "type": md["type"], "title": md["title"]})
+    return md
 
 def list_sections():
     """Return all library sections with basic info."""
@@ -166,7 +183,8 @@ def list_home_users():
         uid = str(u.get("@id"))
         username = (u.get("@username") or "").strip()
         title = (u.get("@title") or "").strip()
+        admin = str(u.get("@admin", "0")) == "1"
         if uid:
-            out[uid] = {"username": username, "display_name": title}
+            out[uid] = {"username": username, "display_name": title, "admin": admin}
     log.info("Home users mapped: %d", len(out))
     return out
