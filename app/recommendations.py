@@ -177,8 +177,31 @@ def _explain_item(uvec: np.ndarray, item_row_dense: np.ndarray, blocks_slices: l
         expl[name] = {"contribution": round(c, 6), "percent_of_score": round(pct, 2)}
     return expl
 
+def _parse_csv_set(val: str) -> set[str]:
+    if not val:
+        return set()
+    return {t.strip() for t in str(val).split(",") if t.strip()}
+
+def _recent_user_collections(user_id: str, lookback: int) -> set[str]:
+    """Collect the set of collections from the user's most recent preferred items."""
+    with engine().begin() as con:
+        df = pd.read_sql_query(
+            """
+            SELECT p.item_id, i.collections_csv
+            FROM user_item_pref p
+            JOIN items i ON i.item_id = p.item_id
+            WHERE p.user_id=:u
+            ORDER BY p.last_seen_at DESC
+            LIMIT :n
+            """, con, params={"u": user_id, "n": lookback}
+        )
+    cols = set()
+    if not df.empty:
+        for s in df["collections_csv"].fillna(""):
+            cols.update(_parse_csv_set(s))
+    return cols
+
 def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
-    """Return top-K recommendations for a user."""
     try:
         vecs, X, id_index = load_artifacts()
     except Exception as e:
@@ -196,29 +219,53 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
             con, params={"u": uid}
         )
         watched = set(df_w["item_id"].astype(str).tolist())
+
         df_items = pd.read_sql_query(
             "SELECT item_id, title, year, genres_csv, collections_csv, poster_url FROM items",
             con
         )
 
-    if df_w.empty:
-        log.info("User %s has no watch history yet (uid=%s)",
-                 info.get("user_name") or info.get("display_name") or user_query, uid)
-    else:
-        log.debug("User %s watched distinct items: %d", uid, len(watched))
-
     uvec = _user_rowvec(uid, X, id_index)
     if not uvec.any():
-        log.info("User %s has no preference vector yet (uid=%s)", user_query, uid)
+        log.info("No user vector for %s", uid)
         return []
 
+    # Candidate rows (unwatched)
     unwatched_idx = [i for i, iid in enumerate(id_index) if iid not in watched]
     if not unwatched_idx:
-        log.info("No unwatched candidates for uid=%s", uid)
         return []
 
     C = X[unwatched_idx]
     scores = np.asarray(C.dot(uvec)).ravel()
+
+    # --- Collections rerank boost ---
+    user_cols = _recent_user_collections(uid, REC_COLLECTION_LOOKBACK)
+    if user_cols:
+        # map candidate item_id -> collections set
+        cand_ids = [id_index[i] for i in unwatched_idx]
+        subset = df_items[df_items["item_id"].isin(cand_ids)][["item_id", "collections_csv"]].copy()
+        subset["collections_set"] = subset["collections_csv"].fillna("").map(_parse_csv_set)
+        col_map = dict(zip(subset["item_id"], subset["collections_set"]))
+
+        # compute binary boost if any intersection with user's collections
+        boost_mask = np.array([
+            1.0 if (col_map.get(cid) and (col_map[cid] & user_cols)) else 0.0
+            for cid in cand_ids
+        ], dtype=np.float32)
+
+        scores = scores + REC_COLLECTION_BOOST * boost_mask
+        if explain:
+            # we’ll annotate later per item if it received a boost
+            boosted_set = {cid for cid, m in zip(cand_ids, boost_mask) if m > 0}
+    else:
+        boosted_set = set()
+
+    # Rank & format
+    def _percentile(x: np.ndarray) -> np.ndarray:
+        order = np.argsort(x)
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(len(x))
+        return ranks / max(len(x) - 1, 1)
 
     pct = _percentile(scores)
     k = max(int(k), 1)
@@ -229,19 +276,46 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
     picks_scores = [float(scores[i]) for i in topk_local]
 
     ord_map = {iid: i for i, iid in enumerate(picks_ids)}
-    out = (df_items[df_items["item_id"].isin(picks_ids)]
-           .assign(__o=lambda d: d["item_id"].map(ord_map))
-           .sort_values("__o"))
+    view = (df_items[df_items["item_id"].isin(picks_ids)]
+            .assign(__o=lambda d: d["item_id"].map(ord_map))
+            .sort_values("__o"))
 
     pct_map = dict(zip(picks_ids, picks_pct))
     sc_map  = dict(zip(picks_ids, picks_scores))
-    max_pct_value = max(pct_map.values()) if pct_map else 0.0
-    blocks_slices = _block_slices(_feature_blocks(vecs)) if explain else None
+    max_pct = max(pct_map.values()) if pct_map else 0.0
+
+    # explain blocks
+    blocks_slices = None
+    if explain:
+        # reconstruct block layout
+        def _feature_blocks(vecs: dict) -> list[tuple[str, int]]:
+            blocks = []
+            def add(name_key, label):
+                v = vecs.get(name_key)
+                size = len(getattr(v, "vocabulary_", {}) or {}) if v is not None else 0
+                if size > 0:
+                    blocks.append((label, size))
+            add("vec_collections", "collections")
+            add("vec_genres", "genres")
+            add("vec_people", "people")
+            add("vec_text", "text")
+            add("vec_year", "year")
+            return blocks
+
+        def _block_slices(blocks):
+            out, start = [], 0
+            for name, size in blocks:
+                stop = start + int(size)
+                out.append((name, slice(start, stop)))
+                start = stop
+            return out
+
+        blocks_slices = _block_slices(_feature_blocks(vecs))
 
     results = []
-    for r in out.itertuples():
-        pct_val = float(pct_map[r.item_id])
-        match_pct = 100 if pct_val >= max_pct_value else int(np.floor(100.0 * pct_val))
+    for r in view.itertuples():
+        pct_val   = float(pct_map[r.item_id])
+        match_pct = 100 if pct_val >= max_pct else int(np.floor(100.0 * pct_val))
         rec = {
             "item_id": r.item_id,
             "title": r.title,
@@ -250,21 +324,24 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
             "collections": (r.collections_csv or ""),
             "poster": r.poster_url,
             "relevancy": match_pct,
-            "score": round(sc_map[r.item_id], 4)
+            "score": round(sc_map[r.item_id], 4),
         }
-        if explain and blocks_slices:
-            pos = ord_map[r.item_id]
-            row_idx = picks_idx[pos]
-            row_dense = X[row_idx].toarray().ravel()
-            rec["explain"] = _explain_item(uvec, row_dense, blocks_slices, sc_map[r.item_id])
-        results.append(rec)
 
-    if results:
-        best = max(picks_scores) if picks_scores else float("nan")
-        median = float(np.median(scores)) if scores.size else float("nan")
-        log.info("Recs for query=%r resolved uid=%s: candidates=%d topK=%d best_cos=%.4f median_cos=%.4f",
-                 user_query, uid, len(unwatched_idx), len(results), best, median)
-    else:
-        log.info("Recs for query=%r resolved uid=%s: no results", user_query, uid)
+        if explain and blocks_slices:
+            row_dense = X[picks_idx[ord_map[r.item_id]]].toarray().ravel()
+            # per-block contributions
+            total = sc_map[r.item_id]
+            eps = 1e-12
+            expl = {}
+            start = 0
+            for name, sl in blocks_slices:
+                c = float(np.dot(uvec[sl], row_dense[sl]))
+                pct_contrib = (c / (total + eps)) * 100.0 if total > 0 else 0.0
+                expl[name] = {"contribution": round(c, 6), "percent_of_score": round(pct_contrib, 2)}
+            if r.item_id in boosted_set:
+                expl["collections_rerank_boost"] = {"contribution": REC_COLLECTION_BOOST, "percent_of_score": None}
+            rec["explain"] = expl
+
+        results.append(rec)
 
     return results

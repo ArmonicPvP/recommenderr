@@ -15,11 +15,14 @@ LOG_FILE = os.getenv("LOG_FILE", "/data/recommenderr.log")
 DISABLE_AUTOSTART = os.getenv("DISABLE_AUTOSTART", "false").lower() in ("1", "true", "yes")
 
 # feature weights (can be tuned via env)
-FEAT_W_GENRES      = float(os.getenv("FEAT_W_GENRES", "1.0"))
-FEAT_W_PEOPLE      = float(os.getenv("FEAT_W_PEOPLE", "0.8"))
-FEAT_W_TEXT        = float(os.getenv("FEAT_W_TEXT", "0.6"))
-FEAT_W_COLLECTIONS = float(os.getenv("FEAT_W_COLLECTIONS", "1.4"))
-FEAT_W_YEAR        = float(os.getenv("FEAT_W_YEAR", "0.5"))
+FEAT_W_GENRES      = float(os.getenv("FEAT_W_GENRES", "0.5"))
+FEAT_W_PEOPLE      = float(os.getenv("FEAT_W_PEOPLE", "1.0"))
+FEAT_W_TEXT        = float(os.getenv("FEAT_W_TEXT", "0.8"))
+FEAT_W_COLLECTIONS = float(os.getenv("FEAT_W_COLLECTIONS", "2.0"))
+FEAT_W_YEAR        = float(os.getenv("FEAT_W_YEAR", "0.4"))
+
+REC_COLLECTION_BOOST     = float(os.getenv("REC_COLLECTION_BOOST", "0.25"))
+REC_COLLECTION_LOOKBACK  = int(os.getenv("REC_COLLECTION_LOOKBACK", "50"))
 
 # year bucketing
 YEAR_BUCKET_SIZE   = int(os.getenv("YEAR_BUCKET_SIZE", "5"))

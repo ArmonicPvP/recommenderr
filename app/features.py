@@ -46,7 +46,7 @@ def build_item_matrix(items_df: pd.DataFrame):
     C = vec_collections.fit_transform(items_df["collections_csv"].fillna(""))
 
     # genres
-    vec_genres = CountVectorizer(token_pattern=r"[^,]+")
+    vec_genres = TfidfVectorizer(token_pattern=r"[^,]+", use_idf=True, norm=None)
     G = vec_genres.fit_transform(items_df["genres_csv"].fillna(""))
 
     # cast + directors
