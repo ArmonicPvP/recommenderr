@@ -225,21 +225,24 @@ def _backfill_missing_items():
 
 def rebuild_prefs_and_vectors():
     """Recompute user_item_pref and rebuild item vectors."""
-    try:
-        _enrich_keywords_if_possible()
-    except Exception as e:
-        log.warning("Keyword enrichment skipped: %s", e)
+    
 
-    items = pd.read_sql_query(
-        """
-        SELECT item_id, title, summary, year,
-               genres_csv, cast_csv, directors_csv, collections_csv,
-               countries_csv, content_rating, keywords_csv
-        FROM items
-        """,
-        con,
-    )
     with engine().begin() as con:
+        try:
+            _enrich_keywords_if_possible()
+        except Exception as e:
+            log.warning("Keyword enrichment skipped: %s", e)
+        items = pd.read_sql_query(
+            """
+            SELECT item_id, title, summary, year,
+                genres_csv, cast_csv, directors_csv, collections_csv,
+                countries_csv, content_rating, keywords_csv
+            FROM items
+            """,
+            con,
+    )
+
+
         df_we = pd.read_sql_query("SELECT user_id,item_id,started_at,duration FROM watch_events", con)
         if not df_we.empty:
             rows = []
