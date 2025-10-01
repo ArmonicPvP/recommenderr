@@ -5,11 +5,7 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.preprocessing import normalize
 from joblib import dump, load
-from .config import (
-    ART_DIR,
-    FEAT_W_GENRES, FEAT_W_PEOPLE, FEAT_W_TEXT, FEAT_W_COLLECTIONS, FEAT_W_YEAR,
-    YEAR_BUCKET_SIZE, YEAR_MIN, YEAR_MAX,
-)
+from .config import (ART_DIR, FEAT_W_GENRES, FEAT_W_PEOPLE, FEAT_W_COLLECTIONS, FEAT_W_YEAR, YEAR_BUCKET_SIZE, YEAR_MIN, YEAR_MAX, FEAT_W_TITLE, FEAT_W_SUMMARY, FEAT_W_COUNTRY, FEAT_W_RATING, FEAT_W_KEYWORDS)
 
 VEC_PATH = os.path.join(ART_DIR, "vectorizers.joblib")
 MAT_PATH = os.path.join(ART_DIR, "items_X.npz")
@@ -33,53 +29,76 @@ def build_item_matrix(items_df: pd.DataFrame):
     items_df["item_id"] = items_df["item_id"].astype(str)
 
     # ensure required columns exist
-    for col in ["title", "summary", "genres_csv", "cast_csv", "directors_csv", "collections_csv", "year"]:
+    for col in [
+        "title","summary","genres_csv","cast_csv","directors_csv",
+        "collections_csv","year","countries_csv","content_rating","keywords_csv"
+    ]:
         if col not in items_df.columns:
-            items_df[col] = None if col == "year" else ""
+            items_df[col] = "" if col != "year" else None
 
-    # text
-    items_df["text"] = (items_df["title"].fillna("") + ". " + items_df["summary"].fillna("")).str.strip()
-
-    # collections
+    # --- collections (strong, binary) ---
     vec_collections = CountVectorizer(token_pattern=r"[^,]+")
     C = vec_collections.fit_transform(items_df["collections_csv"].fillna(""))
 
-    # genres
-    vec_genres = TfidfVectorizer(token_pattern=r"[^,]+", use_idf=True, norm=None)
+    # --- genres (TF-IDF on comma tokens) ---
+    vec_genres = TfidfVectorizer(
+        tokenizer=lambda s: [t.strip() for t in s.split(",") if t.strip()],
+        lowercase=False, min_df=1
+    )
     G = vec_genres.fit_transform(items_df["genres_csv"].fillna(""))
 
-    # cast + directors
-    vec_people = CountVectorizer(token_pattern=r"[^,]+", max_features=6000)
+    # --- people (TF-IDF on comma tokens) ---
+    vec_people = TfidfVectorizer(
+        tokenizer=lambda s: [t.strip() for t in s.split(",") if t.strip()],
+        lowercase=False, max_features=6000, min_df=2
+    )
     P = vec_people.fit_transform(
         (items_df["cast_csv"].fillna("") + "," + items_df["directors_csv"].fillna("")).str.strip(",")
     )
 
-    # title + summary
-    vec_text = TfidfVectorizer(max_features=10000, ngram_range=(1, 2), min_df=2)
-    T = vec_text.fit_transform(items_df["text"].fillna(""))
+    # --- title (TF-IDF; bigrams; low min_df to keep distinctive titles) ---
+    vec_title = TfidfVectorizer(max_features=5000, ngram_range=(1,2), min_df=1)
+    Tt = vec_title.fit_transform(items_df["title"].fillna(""))
 
-    # year buckets
+    # --- summary (TF-IDF; bigrams; slightly higher min_df to reduce noise) ---
+    vec_summary = TfidfVectorizer(max_features=15000, ngram_range=(1,2), min_df=2)
+    Ts = vec_summary.fit_transform(items_df["summary"].fillna(""))
+
+    # --- year buckets (Count) ---
     items_df["year_bucket"] = _year_bucket_feature(items_df["year"])
     vec_year = CountVectorizer(token_pattern=r"[^,]+")
     Y = vec_year.fit_transform(items_df["year_bucket"].fillna("year_unknown"))
 
-    # weighted stack
+    # --- NEW: country (Count on comma tokens) ---
+    vec_country = CountVectorizer(token_pattern=r"[^,]+")
+    Co = vec_country.fit_transform(items_df["countries_csv"].fillna(""))
+
+    # --- NEW: content rating (Count single token) ---
+    vec_rating = CountVectorizer(token_pattern=r"[^,]+")
+    R = vec_rating.fit_transform(items_df["content_rating"].fillna(""))
+
+    # --- NEW: TMDB keywords (TF-IDF on comma tokens) ---
+    vec_kw = TfidfVectorizer(
+        tokenizer=lambda s: [t.strip() for t in s.split(",") if t.strip()],
+        lowercase=False, min_df=1
+    )
+    K = vec_kw.fit_transform(items_df["keywords_csv"].fillna(""))
+
+    # --- Weighted stack ---
     mats, weights = [], []
-    if C.shape[1] > 0 and FEAT_W_COLLECTIONS > 0:
-        mats.append(C)
-        weights.append(FEAT_W_COLLECTIONS)
-    if G.shape[1] > 0 and FEAT_W_GENRES > 0:
-        mats.append(G)
-        weights.append(FEAT_W_GENRES)
-    if P.shape[1] > 0 and FEAT_W_PEOPLE > 0:
-        mats.append(P)
-        weights.append(FEAT_W_PEOPLE)
-    if T.shape[1] > 0 and FEAT_W_TEXT > 0:
-        mats.append(T)
-        weights.append(FEAT_W_TEXT)
-    if Y.shape[1] > 0 and FEAT_W_YEAR > 0:
-        mats.append(Y)
-        weights.append(FEAT_W_YEAR)
+    def add(m, w): 
+        if m.shape[1] > 0 and w > 0: 
+            mats.append(m); weights.append(w)
+
+    add(C, FEAT_W_COLLECTIONS)
+    add(G, FEAT_W_GENRES)
+    add(P, FEAT_W_PEOPLE)
+    add(Tt, FEAT_W_TITLE)
+    add(Ts, FEAT_W_SUMMARY)
+    add(Y, FEAT_W_YEAR)
+    add(Co, FEAT_W_COUNTRY)
+    add(R, FEAT_W_RATING)
+    add(K, FEAT_W_KEYWORDS)
 
     if not mats:
         raise RuntimeError("No feature matrices produced; check inputs/weights")
@@ -92,14 +111,22 @@ def build_item_matrix(items_df: pd.DataFrame):
         "vec_collections": vec_collections,
         "vec_genres": vec_genres,
         "vec_people": vec_people,
-        "vec_text": vec_text,
+        "vec_title": vec_title,
+        "vec_summary": vec_summary,
         "vec_year": vec_year,
+        "vec_country": vec_country,
+        "vec_rating": vec_rating,
+        "vec_keywords": vec_kw,
         "weights": {
             "collections": FEAT_W_COLLECTIONS,
             "genres": FEAT_W_GENRES,
             "people": FEAT_W_PEOPLE,
-            "text": FEAT_W_TEXT,
+            "title": FEAT_W_TITLE,
+            "summary": FEAT_W_SUMMARY,
             "year": FEAT_W_YEAR,
+            "country": FEAT_W_COUNTRY,
+            "rating": FEAT_W_RATING,
+            "keywords": FEAT_W_KEYWORDS,
             "year_bucket_size": YEAR_BUCKET_SIZE,
         },
     }, VEC_PATH)

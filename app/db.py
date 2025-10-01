@@ -45,4 +45,30 @@ def ensure_schema():
         except Exception:
             pass
 
+        # feature columns on items (used by the vectorizer)
+        item_migrations = [
+            ("content_rating", "ALTER TABLE items ADD COLUMN content_rating TEXT"),
+            ("countries_csv", "ALTER TABLE items ADD COLUMN countries_csv TEXT"),
+            ("keywords_csv",  "ALTER TABLE items ADD COLUMN keywords_csv TEXT"),
+            ("tmdb_id",       "ALTER TABLE items ADD COLUMN tmdb_id TEXT"),
+        ]
+        for col, ddl in item_migrations:
+            if not _column_exists(con, "items", col):
+                log.info("Migrating: add items.%s", col)
+                con.exec_driver_sql(ddl)
+
+        # Helpful indexes (idempotent; ignore errors if present)
+        try:
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_items_year ON items(year)"
+            )
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_items_tmdb ON items(tmdb_id)"
+            )
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_pref_user ON user_item_pref(user_id)"
+            )
+        except Exception:
+            pass
+
     log.debug("Schema ensured")

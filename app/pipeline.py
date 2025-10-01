@@ -6,6 +6,37 @@ import pandas as pd
 from .db import engine, ensure_schema
 from .plex import iter_history, fetch_metadata, list_sections, iter_library_items, list_home_users
 from .features import build_item_matrix
+from .tmdb import fetch_keywords_for_movie
+
+def _enrich_keywords_if_possible():
+    from .config import TMDB_API_KEY
+    if not TMDB_API_KEY:
+        return 0
+    added = 0
+    with engine().begin() as con:
+        rows = con.exec_driver_sql(
+            """
+            SELECT item_id, tmdb_id FROM items
+            WHERE (tmdb_id IS NOT NULL AND tmdb_id != '')
+              AND (keywords_csv IS NULL OR keywords_csv = '')
+            LIMIT 300
+            """
+        ).fetchall()
+    for item_id, tmdb_id in rows:
+        kw = fetch_keywords_for_movie(str(tmdb_id))
+        if kw:
+            csv = ",".join(sorted(set(kw)))
+            with engine().begin() as con:
+                con.exec_driver_sql(
+                    "UPDATE items SET keywords_csv=:csv WHERE item_id=:iid",
+                    {"csv": csv, "iid": str(item_id)}
+                )
+            added += 1
+        time.sleep(0.02)  # ~50 rps max
+    if added:
+        log.info("TMDB keywords enriched for %d items", added)
+    return added
+
 
 log = logging.getLogger(__name__)
 
@@ -194,6 +225,20 @@ def _backfill_missing_items():
 
 def rebuild_prefs_and_vectors():
     """Recompute user_item_pref and rebuild item vectors."""
+    try:
+        _enrich_keywords_if_possible()
+    except Exception as e:
+        log.warning("Keyword enrichment skipped: %s", e)
+
+    items = pd.read_sql_query(
+        """
+        SELECT item_id, title, summary, year,
+               genres_csv, cast_csv, directors_csv, collections_csv,
+               countries_csv, content_rating, keywords_csv
+        FROM items
+        """,
+        con,
+    )
     with engine().begin() as con:
         df_we = pd.read_sql_query("SELECT user_id,item_id,started_at,duration FROM watch_events", con)
         if not df_we.empty:
