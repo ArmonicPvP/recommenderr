@@ -1,4 +1,3 @@
-# app/plex.py
 import logging
 import httpx
 import xmltodict
@@ -166,7 +165,8 @@ def list_home_users():
         uid = str(u.get("@id"))
         username = (u.get("@username") or "").strip()
         title = (u.get("@title") or "").strip()
+        admin = str(u.get("@admin", "0")) == "1"
         if uid:
-            out[uid] = {"username": username, "display_name": title}
+            out[uid] = {"username": username, "display_name": title, "admin": admin}
     log.info("Home users mapped: %d", len(out))
     return out

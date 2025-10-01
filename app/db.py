@@ -1,4 +1,3 @@
-# app/db.py
 import logging
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine

@@ -1,4 +1,3 @@
-# app/pipeline.py
 import math
 import time
 import logging
@@ -35,12 +34,18 @@ def ingest_once():
     ensure_schema()
     t0 = time.time()
     with engine().begin() as con:
-        # users
+        # 1) Sync users and find admin uid
+        user_map = {}
+        admin_uid = None
         try:
             home_map = list_home_users()
             for uid, payload in home_map.items():
                 uname = (payload.get("username") or "").strip() or None
                 dname = (payload.get("display_name") or "").strip() or None
+                is_admin = bool(payload.get("admin"))
+                if is_admin:
+                    admin_uid = uid
+
                 con.exec_driver_sql(
                     """
                     INSERT INTO users(user_id, user_name, display_name)
@@ -51,17 +56,36 @@ def ingest_once():
                     """,
                     {"uid": uid, "uname": uname, "dname": dname},
                 )
-            log.info("User sync complete: %d users", len(home_map))
+                user_map[uid] = {"username": uname, "display_name": dname, "admin": is_admin}
+            log.info("User sync complete: %d users (admin_uid=%s)", len(home_map), admin_uid)
         except Exception as e:
             log.warning("Could not sync home users: %s", e)
 
-        # history
+        # 1a) If we know the admin, rewrite any PMS-local rows (user_id='1') to that real uid
+        if admin_uid:
+            updated_we = con.exec_driver_sql(
+                "UPDATE watch_events SET user_id=:admin WHERE user_id='1'", {"admin": admin_uid}
+            ).rowcount
+            updated_pref = con.exec_driver_sql(
+                "UPDATE user_item_pref SET user_id=:admin WHERE user_id='1'", {"admin": admin_uid}
+            ).rowcount
+            if updated_we or updated_pref:
+                log.info("Remapped PMS user_id=1 → %s (we=%d, prefs=%d)", admin_uid, updated_we, updated_pref)
+
+        # 2) Ingest history; also rewrite incoming '1' to admin_uid immediately
         count = 0
         for row in iter_history():
+            raw_uid = str(row.get("user_id") or "")
+            uid = admin_uid if (raw_uid == "1" and admin_uid) else raw_uid
+
             item_id = row.get("item_id")
             if not item_id:
+                log.debug("Skipping history row without item_id: %s", row)
                 continue
-            uid = str(row.get("user_id") or "")
+
+            cached = user_map.get(uid) or {}
+            friendly = cached.get("username") or cached.get("display_name") or None
+
             started_iso = _ts_to_iso_utc(row.get("started_at"))
             stopped_iso = _ts_to_iso_utc(row.get("stopped_at"))
 
@@ -72,11 +96,14 @@ def ingest_once():
                     started_at, stopped_at,
                     duration, view_offset, completed, source
                 )
-                VALUES (:uid, NULL, :iid, :st, :sp, :dur, :off, 1, 'plex')
+                VALUES (:uid, :uname, :iid, :st, :sp, :dur, :off, 1, 'plex')
                 """,
                 {
-                    "uid": uid, "iid": item_id,
-                    "st": started_iso, "sp": stopped_iso,
+                    "uid": uid,
+                    "uname": friendly,
+                    "iid": item_id,
+                    "st": started_iso,
+                    "sp": stopped_iso,
                     "dur": row.get("duration") or 0,
                     "off": row.get("view_offset") or 0,
                 },

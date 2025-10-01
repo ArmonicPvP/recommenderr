@@ -1,4 +1,3 @@
-# app/scheduler.py
 import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from .pipeline import ingest_once, rebuild_prefs_and_vectors, scan_library_all

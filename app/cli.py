@@ -1,4 +1,3 @@
-# app/cli.py
 import json
 import logging
 import typer
