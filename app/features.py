@@ -5,103 +5,41 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.preprocessing import normalize
 from joblib import dump, load
-from .config import (ART_DIR, FEAT_W_GENRES, FEAT_W_PEOPLE, FEAT_W_COLLECTIONS, FEAT_W_YEAR, YEAR_BUCKET_SIZE, YEAR_MIN, YEAR_MAX, FEAT_W_TITLE, FEAT_W_SUMMARY, FEAT_W_COUNTRY, FEAT_W_RATING, FEAT_W_KEYWORDS)
+
+from .config import (ART_DIR, FEAT_W_GENRES, FEAT_W_PEOPLE, FEAT_W_COLLECTIONS, FEAT_W_YEAR, YEAR_BUCKET_SIZE, YEAR_MIN, YEAR_MAX, FEAT_W_TITLE, FEAT_W_SUMMARY, FEAT_W_COUNTRY, FEAT_W_RATING, FEAT_W_KEYWORDS,
+)
 
 VEC_PATH = os.path.join(ART_DIR, "vectorizers.joblib")
 MAT_PATH = os.path.join(ART_DIR, "items_X.npz")
 IDX_PATH = os.path.join(ART_DIR, "items_index.csv")
-def _canonicalize_csv_field(series: pd.Series) -> pd.Series:
-    """
-    Normalize comma-separated string fields:
-      - split on commas
-      - trim whitespace
-      - drop empties
-      - de-duplicate while keeping stable order
-      - join back with a single comma
-    """
-    def _dedup_keep_order(tokens):
-        seen = set()
-        out = []
-        for t in tokens:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
 
-    series = series.fillna("").astype(str)
-    cleaned = []
-    for s in series:
-        toks = [t.strip() for t in s.split(",") if t.strip()]
-        toks = _dedup_keep_order(toks)
-        cleaned.append(",".join(toks))
-    return pd.Series(cleaned, index=series.index)
-
+def csv_tokenizer(s: str):
+    """Split comma-separated fields into tokens."""
+    if s is None:
+        return []
+    return [t.strip() for t in str(s).split(",") if t and t.strip()]
 
 def _year_bucket_feature(year: pd.Series) -> pd.Series:
-    """
-    Map numeric year to buckets [lo..hi] with width YEAR_BUCKET_SIZE (>=1).
-    Falls back to at least 1-year buckets defensively.
-    """
     y = pd.to_numeric(year, errors="coerce")
     mask = y.notna()
-
-    step = max(1, YEAR_BUCKET_SIZE)
     y_clamped = y.clip(lower=YEAR_MIN, upper=YEAR_MAX)
-
+    step = max(1, YEAR_BUCKET_SIZE)
     lo = (np.floor((y_clamped - YEAR_MIN) / step) * step + YEAR_MIN).astype("Int64")
     hi = (lo + step - 1).astype("Int64")
-
     labels = pd.Series(["year_unknown"] * len(year), index=year.index, dtype=object)
-    labels[mask] = "year_" + lo[mask].astype(str) + "_" + hi[mask].astype(str)
+    if YEAR_BUCKET_SIZE == 10:
+        labels[mask] = "year_" + lo[mask].astype(str).str[:4] + "s"
+    else:
+        labels[mask] = "year_" + lo[mask].astype(str) + "_" + hi[mask].astype(str)
     return labels.fillna("year_unknown")
 
-
-def _safe_fit_tf_idf_on_csv(vec: TfidfVectorizer, series: pd.Series) -> tuple[sp.csr_matrix, TfidfVectorizer | None]:
-    """
-    Fit a TF-IDF vectorizer on comma-separated fields safely.
-    We pre-canonicalize to strip spaces so we can rely on token_pattern='[^,]+'.
-    Returns (X, vec_or_None) where X may be empty (n x 0) if no tokens exist.
-    """
-    s = _canonicalize_csv_field(series)
-    if (s == "").all():
-        # all rows empty -> no vocab
-        return sp.csr_matrix((len(s), 0), dtype=np.float32), None
-    try:
-        X = vec.fit_transform(s)
-        return X, vec
-    except ValueError:
-        return sp.csr_matrix((len(s), 0), dtype=np.float32), None
-
-
-def _safe_fit_count_on_csv(vec: CountVectorizer, series: pd.Series) -> tuple[sp.csr_matrix, CountVectorizer | None]:
-    """
-    Fit a Count vectorizer on comma-separated fields safely.
-    """
-    s = _canonicalize_csv_field(series)
-    if (s == "").all():
-        return sp.csr_matrix((len(s), 0), dtype=np.float32), None
-    try:
-        X = vec.fit_transform(s)
-        return X, vec
-    except ValueError:
-        return sp.csr_matrix((len(s), 0), dtype=np.float32), None
-
-
-def _safe_fit_text(vec, series: pd.Series) -> tuple[sp.csr_matrix, object | None]:
-    """
-    Fit a word/bigram text vectorizer on free text safely.
-    """
-    s = series.fillna("").astype(str)
-    if (s.str.strip() == "").all():
-        return sp.csr_matrix((len(s), 0), dtype=np.float32), None
-    try:
-        X = vec.fit_transform(s)
-        return X, vec
-    except ValueError:
-        return sp.csr_matrix((len(s), 0), dtype=np.float32), None
-
-
-# ---------- main builder ----------
+def _l2_row_normalize(X: sp.csr_matrix) -> sp.csr_matrix:
+    # safe L2 row-normalization for sparse matrices
+    X = X.tocsr(copy=False)
+    row_sums = np.sqrt(X.multiply(X).sum(axis=1)).A.ravel()
+    row_sums[row_sums == 0.0] = 1.0
+    inv = sp.diags(1.0 / row_sums)
+    return inv.dot(X)
 
 def build_item_matrix(items_df: pd.DataFrame):
     items_df = items_df.copy()
@@ -110,50 +48,53 @@ def build_item_matrix(items_df: pd.DataFrame):
     # Ensure required columns exist
     for col in [
         "title", "summary", "genres_csv", "cast_csv", "directors_csv",
-        "collections_csv", "year", "countries_csv", "content_rating", "keywords_csv"
+        "collections_csv", "year", "countries_csv", "content_rating",
+        "keywords_csv", "media_type",
     ]:
         if col not in items_df.columns:
             items_df[col] = "" if col != "year" else None
 
-    # collections (binary-ish, strong)
-    vec_collections = CountVectorizer(token_pattern=r"[^,]+", lowercase=False)
-    C, vec_collections = _safe_fit_count_on_csv(vec_collections, items_df["collections_csv"])
+    # --- Compute year buckets BEFORE vectorizing ---
+    items_df["year_bucket"] = _year_bucket_feature(items_df["year"])
+
+    # collections (binary/count on comma tokens)
+    vec_collections = CountVectorizer(tokenizer=csv_tokenizer, lowercase=False)
+    C = vec_collections.fit_transform(items_df["collections_csv"].fillna(""))
 
     # genres (TF-IDF on comma tokens)
-    vec_genres = TfidfVectorizer(token_pattern=r"[^,]+", lowercase=False, min_df=1)
-    G, vec_genres = _safe_fit_tf_idf_on_csv(vec_genres, items_df["genres_csv"])
+    vec_genres = TfidfVectorizer(tokenizer=csv_tokenizer, lowercase=False, min_df=1)
+    G = vec_genres.fit_transform(items_df["genres_csv"].fillna(""))
 
-    # people (cast + directors) as TF-IDF on comma tokens
-    people_csv = (items_df["cast_csv"].fillna("") + "," + items_df["directors_csv"].fillna("")).str.strip(",")
-    vec_people = TfidfVectorizer(token_pattern=r"[^,]+", lowercase=False, max_features=6000, min_df=2)
-    P, vec_people = _safe_fit_tf_idf_on_csv(vec_people, people_csv)
 
-    # title (TF-IDF; bigrams; low min_df to keep distinctive titles)
+    # people (cast + directors) — TF-IDF on comma tokens
+    vec_people = TfidfVectorizer(tokenizer=csv_tokenizer, lowercase=False, max_features=6000, min_df=2)
+    P = vec_people.fit_transform((items_df["cast_csv"].fillna("") + "," + items_df["directors_csv"].fillna("")).str.strip(","))
+
+    # title (TF-IDF; bigrams; low min_df)
     vec_title = TfidfVectorizer(max_features=5000, ngram_range=(1, 2), min_df=1)
-    Tt, vec_title = _safe_fit_text(vec_title, items_df["title"])
+    Tt = vec_title.fit_transform(items_df["title"].fillna(""))
 
-    # summary (TF-IDF; bigrams; slightly higher min_df to reduce noise)
+    # summary (TF-IDF; bigrams; slightly higher min_df)
     vec_summary = TfidfVectorizer(max_features=15000, ngram_range=(1, 2), min_df=2)
-    Ts, vec_summary = _safe_fit_text(vec_summary, items_df["summary"])
+    Ts = vec_summary.fit_transform(items_df["summary"].fillna(""))
 
     # year buckets (Count)
-    items_df["year_bucket"] = _year_bucket_feature(items_df["year"])
-    vec_year = CountVectorizer(token_pattern=r"[^,]+", lowercase=False)
-    Y, vec_year = _safe_fit_count_on_csv(vec_year, items_df["year_bucket"])
+    vec_year = CountVectorizer(token_pattern=r"[^,]+")
+    Y = vec_year.fit_transform(items_df["year_bucket"].fillna("year_unknown"))
 
-    # country (Count on comma tokens) — countries_csv may be multi-valued
-    vec_country = CountVectorizer(token_pattern=r"[^,]+", lowercase=False)
-    Co, vec_country = _safe_fit_count_on_csv(vec_country, items_df["countries_csv"])
+    # country (Count on comma tokens; supports multiple countries)
+    vec_country = CountVectorizer(tokenizer=csv_tokenizer, lowercase=False)
+    Co = vec_country.fit_transform(items_df["countries_csv"].fillna(""))
 
-    # content rating (Count, single token per row typical)
-    vec_rating = CountVectorizer(token_pattern=r"[^,]+", lowercase=False)
-    R, vec_rating = _safe_fit_count_on_csv(vec_rating, items_df["content_rating"])
+    # content rating (Count — usually a single token like "PG-13" or "TV-MA")
+    vec_rating = CountVectorizer(token_pattern=r"[^,]+")
+    R = vec_rating.fit_transform(items_df["content_rating"].fillna(""))
 
     # TMDB keywords (TF-IDF on comma tokens)
-    vec_kw = TfidfVectorizer(token_pattern=r"[^,]+", lowercase=False, min_df=1)
-    K, vec_kw = _safe_fit_tf_idf_on_csv(vec_kw, items_df["keywords_csv"])
+    vec_kw = TfidfVectorizer(tokenizer=csv_tokenizer, lowercase=False, min_df=1)
+    K = vec_kw.fit_transform(items_df["keywords_csv"].fillna(""))
 
-    # Weighted stack
+    # --- Weighted stack (order must match recommendations.py explain) ---
     mats, weights = [], []
 
     def add(m, w):
@@ -161,24 +102,25 @@ def build_item_matrix(items_df: pd.DataFrame):
             mats.append(m)
             weights.append(w)
 
-    add(C,  FEAT_W_COLLECTIONS)
-    add(G,  FEAT_W_GENRES)
-    add(P,  FEAT_W_PEOPLE)
+    # Order: collections, genres, people, title, summary, year, country, rating, keywords
+    add(C, FEAT_W_COLLECTIONS)
+    add(G, FEAT_W_GENRES)
+    add(P, FEAT_W_PEOPLE)
     add(Tt, FEAT_W_TITLE)
     add(Ts, FEAT_W_SUMMARY)
-    add(Y,  FEAT_W_YEAR)
+    add(Y, FEAT_W_YEAR)
     add(Co, FEAT_W_COUNTRY)
-    add(R,  FEAT_W_RATING)
-    add(K,  FEAT_W_KEYWORDS)
+    add(R, FEAT_W_RATING)
+    add(K, FEAT_W_KEYWORDS)
 
     if not mats:
-        raise RuntimeError("No feature matrices produced; check inputs/weights and source data.")
+        raise RuntimeError("No feature matrices produced; check inputs/weights")
 
-    # Apply weights, stack, normalize
     mats = [m.multiply(w) for m, w in zip(mats, weights)]
     X = sp.hstack(mats, format="csr")
-    X = normalize(X)
+    X = _l2_row_normalize(X)  # consistent with cosine scoring
 
+    # Persist artifacts
     dump(
         {
             "vec_collections": vec_collections,

@@ -2,6 +2,8 @@ import logging
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from typing import Tuple, List, Dict, Set, Optional
+
 from .db import engine
 from .features import load_artifacts
 from .config import REC_COLLECTION_BOOST, REC_COLLECTION_LOOKBACK
@@ -34,7 +36,7 @@ def _user_has_prefs(user_id: str) -> bool:
         ).fetchone()
     return hit is not None
 
-def _find_alias_with_prefs(user_row) -> str | None:
+def _find_alias_with_prefs(user_row) -> Optional[str]:
     """
     Safe aliasing:
       - Prefer exact username match across rows (non-empty usernames only)
@@ -95,7 +97,7 @@ def _find_alias_with_prefs(user_row) -> str | None:
     )
     return None
 
-def _resolve_user(query: str) -> tuple[str | None, dict]:
+def _resolve_user(query: str) -> Tuple[Optional[str], Dict]:
     row = _get_user_row(query)
     if not row:
         return None, {}
@@ -111,7 +113,7 @@ def _resolve_user(query: str) -> tuple[str | None, dict]:
 # User vector construction
 # ---------------------------
 
-def _build_user_rowvec_from_pairs(pairs, X: sp.csr_matrix, id_index: list[str]) -> np.ndarray:
+def _build_user_rowvec_from_pairs(pairs, X: sp.csr_matrix, id_index: List[str]) -> np.ndarray:
     if not pairs:
         return np.zeros((X.shape[1],), dtype=np.float32)
     idx = {iid: i for i, iid in enumerate(id_index)}
@@ -139,7 +141,7 @@ def _build_user_rowvec_from_pairs(pairs, X: sp.csr_matrix, id_index: list[str]) 
     n = np.linalg.norm(v)
     return v / (n + 1e-12)
 
-def _user_rowvec(uid: str, X: sp.csr_matrix, id_index: list[str]) -> np.ndarray:
+def _user_rowvec(uid: str, X: sp.csr_matrix, id_index: List[str]) -> np.ndarray:
     with engine().begin() as con:
         dfp = pd.read_sql_query(
             """
@@ -175,12 +177,12 @@ def _user_rowvec(uid: str, X: sp.csr_matrix, id_index: list[str]) -> np.ndarray:
 # Helpers for boosts/explain
 # ---------------------------
 
-def _parse_csv_set(val: str) -> set[str]:
+def _parse_csv_set(val: str) -> Set[str]:
     if not val:
         return set()
     return {t.strip() for t in str(val).split(",") if t.strip()}
 
-def _recent_user_collections(user_id: str, lookback: int) -> set[str]:
+def _recent_user_collections(user_id: str, lookback: int) -> Set[str]:
     """Collect the set of collections from the user's most recent preferred items."""
     with engine().begin() as con:
         df = pd.read_sql_query(
@@ -199,12 +201,12 @@ def _recent_user_collections(user_id: str, lookback: int) -> set[str]:
             cols.update(_parse_csv_set(s))
     return cols
 
-def _feature_blocks_from_vecs(vecs: dict) -> list[tuple[str, int]]:
+def _feature_blocks_from_vecs(vecs: dict) -> List[tuple[str, int]]:
     """
     Reconstruct the stacked block layout to support per-block explanations.
     Mirrors features.py (order and available vectorizers).
     """
-    blocks: list[tuple[str, int]] = []
+    blocks: List[tuple[str, int]] = []
 
     def maybe_add(key: str, label: str):
         v = vecs.get(key)
@@ -212,7 +214,7 @@ def _feature_blocks_from_vecs(vecs: dict) -> list[tuple[str, int]]:
         if size > 0:
             blocks.append((label, size))
 
-    # Keep order consistent with your features stacking:
+    # Order must match features.py stacking:
     # collections, genres, people, title, summary, year, country, rating, keywords
     maybe_add("vec_collections", "collections")
     maybe_add("vec_genres", "genres")
@@ -225,8 +227,9 @@ def _feature_blocks_from_vecs(vecs: dict) -> list[tuple[str, int]]:
     maybe_add("vec_keywords", "keywords")
     return blocks
 
-def _block_slices(blocks: list[tuple[str, int]]) -> list[tuple[str, slice]]:
-    out, start = [], 0
+def _block_slices(blocks: List[tuple[str, int]]) -> List[tuple[str, slice]]:
+    out: List[tuple[str, slice]] = []
+    start = 0
     for name, size in blocks:
         stop = start + int(size)
         out.append((name, slice(start, stop)))
@@ -242,7 +245,7 @@ def recommend_for_username(
     user_query: str,
     k: int = 10,
     explain: bool = False,
-    media_type: str | None = None,   # "movie", "tv", or None for all
+    media_type: Optional[str] = None,   # "movie", "tv", or None for all
 ):
     """Return top-K recommendations for a user (optionally restricted to media_type)."""
     media_type = (media_type or "").strip().lower() or None
@@ -285,9 +288,11 @@ def recommend_for_username(
         log.debug("User %s watched distinct items: %d", uid, len(watched))
 
     # Filter candidate ids by media_type if requested
-    allowed_ids: set[str] | None = None
+    allowed_ids: Optional[Set[str]] = None
     if media_type:
-        allowed_ids = set(df_items.loc[df_items["media_type"].str.lower() == media_type, "item_id"].astype(str))
+        # Normalize to lower and handle NULLs
+        mt = df_items["media_type"].fillna("").str.lower()
+        allowed_ids = set(df_items.loc[mt == media_type, "item_id"].astype(str))
 
     # Build user preference vector
     uvec = _user_rowvec(uid, X, id_index)
@@ -360,7 +365,7 @@ def recommend_for_username(
     if explain:
         blocks_slices = _block_slices(_feature_blocks_from_vecs(vecs))
 
-    results = []
+    results: List[Dict] = []
     for r in view.itertuples():
         pct_val = float(pct_map[r.item_id])
         match_pct = 100 if pct_val >= max_pct_value else int(np.floor(100.0 * pct_val))
