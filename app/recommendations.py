@@ -49,7 +49,7 @@ def _find_alias_with_prefs(user_row) -> str | None:
         with engine().begin() as con:
             rows = con.exec_driver_sql(sql, params).fetchall()
         for r in rows or []:
-            cand_uid, cand_uname, cand_dname = r[0], (r[1] or "").strip(), (r[2] or "").strip()
+            cand_uid, cand_uname, _ = r[0], (r[1] or "").strip(), (r[2] or "").strip()
             # Skip managed/guest (empty username)
             if not cand_uname:
                 continue
@@ -321,7 +321,6 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
             total = sc_map[r.item_id]
             eps = 1e-12
             expl = {}
-            start = 0
             for name, sl in blocks_slices:
                 c = float(np.dot(uvec[sl], row_dense[sl]))
                 pct_contrib = (c / (total + eps)) * 100.0 if total > 0 else 0.0
