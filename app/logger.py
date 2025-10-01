@@ -1,25 +1,26 @@
 import logging
 import os
+import time
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
 
 def init_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     log_file = os.getenv("LOG_FILE", "/data/recommenderr.log")
 
-    class UtcFormatter(logging.Formatter):
-        converter = staticmethod(lambda *args: datetime.utcnow().timetuple())
+    fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    datefmt = "%Y-%m-%dT%H:%M:%SZ"
 
-    fmt = "%Y-%m-%dT%H:%M:%SZ %(levelname)s [%(name)s] %(message)s"
+    logging.Formatter.converter = time.gmtime
+    formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
 
     sh = logging.StreamHandler()
-    sh.setFormatter(UtcFormatter(fmt))
     sh.setLevel(level)
+    sh.setFormatter(formatter)
 
     fh = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3)
-    fh.setFormatter(UtcFormatter(fmt))
     fh.setLevel(level)
+    fh.setFormatter(formatter)
 
     root = logging.getLogger()
     root.handlers.clear()
