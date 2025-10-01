@@ -8,6 +8,11 @@ from .config import REC_COLLECTION_BOOST, REC_COLLECTION_LOOKBACK
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------
+# User resolution / aliasing
+# ---------------------------
+
 def _get_user_row(query: str):
     with engine().begin() as con:
         row = con.exec_driver_sql(
@@ -101,6 +106,11 @@ def _resolve_user(query: str) -> tuple[str | None, dict]:
         log.info("Resolved user query=%r uid=%s → chosen uid=%s (alias with prefs)", query, uid, chosen)
     return chosen, info
 
+
+# ---------------------------
+# User vector construction
+# ---------------------------
+
 def _build_user_rowvec_from_pairs(pairs, X: sp.csr_matrix, id_index: list[str]) -> np.ndarray:
     if not pairs:
         return np.zeros((X.shape[1],), dtype=np.float32)
@@ -160,6 +170,11 @@ def _user_rowvec(uid: str, X: sp.csr_matrix, id_index: list[str]) -> np.ndarray:
     pairs2 = [(str(r.item_id), r.last_seen_at) for r in dfw.itertuples()] if not dfw.empty else []
     return _build_user_rowvec_from_pairs(pairs2, X, id_index)
 
+
+# ---------------------------
+# Helpers for boosts/explain
+# ---------------------------
+
 def _parse_csv_set(val: str) -> set[str]:
     if not val:
         return set()
@@ -184,8 +199,56 @@ def _recent_user_collections(user_id: str, lookback: int) -> set[str]:
             cols.update(_parse_csv_set(s))
     return cols
 
-"""Return top-K recommendations for a user."""
-def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
+def _feature_blocks_from_vecs(vecs: dict) -> list[tuple[str, int]]:
+    """
+    Reconstruct the stacked block layout to support per-block explanations.
+    Mirrors features.py (order and available vectorizers).
+    """
+    blocks: list[tuple[str, int]] = []
+
+    def maybe_add(key: str, label: str):
+        v = vecs.get(key)
+        size = len(getattr(v, "vocabulary_", {}) or {}) if v is not None else 0
+        if size > 0:
+            blocks.append((label, size))
+
+    # Keep order consistent with your features stacking:
+    # collections, genres, people, title, summary, year, country, rating, keywords
+    maybe_add("vec_collections", "collections")
+    maybe_add("vec_genres", "genres")
+    maybe_add("vec_people", "people")
+    maybe_add("vec_title", "title")
+    maybe_add("vec_summary", "summary")
+    maybe_add("vec_year", "year")
+    maybe_add("vec_country", "country")
+    maybe_add("vec_rating", "rating")
+    maybe_add("vec_keywords", "keywords")
+    return blocks
+
+def _block_slices(blocks: list[tuple[str, int]]) -> list[tuple[str, slice]]:
+    out, start = [], 0
+    for name, size in blocks:
+        stop = start + int(size)
+        out.append((name, slice(start, stop)))
+        start = stop
+    return out
+
+
+# ---------------------------
+# Public API
+# ---------------------------
+
+def recommend_for_username(
+    user_query: str,
+    k: int = 10,
+    explain: bool = False,
+    media_type: str | None = None,   # "movie", "tv", or None for all
+):
+    """Return top-K recommendations for a user (optionally restricted to media_type)."""
+    media_type = (media_type or "").strip().lower() or None
+    if media_type not in (None, "movie", "tv"):
+        media_type = None  # be forgiving
+
     try:
         vecs, X, id_index = load_artifacts()
     except Exception as e:
@@ -203,31 +266,50 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
             con, params={"u": uid}
         )
         watched = set(df_w["item_id"].astype(str).tolist())
+
+        # Pull minimal item columns + media_type for filtering
         df_items = pd.read_sql_query(
-            "SELECT item_id, title, year, genres_csv, collections_csv, poster_url FROM items",
+            """
+            SELECT item_id, title, year, genres_csv, collections_csv, poster_url, media_type
+            FROM items
+            """,
             con
         )
+
     if df_w.empty:
-        log.info("User %s has no watch history yet (uid=%s)",
-                 info.get("user_name") or info.get("display_name") or user_query, uid)
+        log.info(
+            "User %s has no watch history yet (uid=%s)",
+            info.get("user_name") or info.get("display_name") or user_query, uid
+        )
     else:
         log.debug("User %s watched distinct items: %d", uid, len(watched))
 
+    # Filter candidate ids by media_type if requested
+    allowed_ids: set[str] | None = None
+    if media_type:
+        allowed_ids = set(df_items.loc[df_items["media_type"].str.lower() == media_type, "item_id"].astype(str))
+
+    # Build user preference vector
     uvec = _user_rowvec(uid, X, id_index)
     if not uvec.any():
         log.info("User %s has no preference vector yet (uid=%s)", user_query, uid)
         return []
 
-    # Candidate rows (unwatched)
-    unwatched_idx = [i for i, iid in enumerate(id_index) if iid not in watched]
+    # Candidate rows (unwatched, and media-type constrained if provided)
+    if allowed_ids is None:
+        unwatched_idx = [i for i, iid in enumerate(id_index) if iid not in watched]
+    else:
+        unwatched_idx = [i for i, iid in enumerate(id_index) if (iid not in watched and iid in allowed_ids)]
+
     if not unwatched_idx:
-        log.info("No unwatched candidates for uid=%s", uid)
+        log.info("No unwatched candidates for uid=%s (media_type=%s)", uid, media_type or "any")
         return []
 
+    # Scores from the item matrix vs user vector
     C = X[unwatched_idx]
     scores = np.asarray(C.dot(uvec)).ravel()
 
-    # --- Collections rerank boost ---
+    # --- Collections rerank boost (binary) ---
     user_cols = _recent_user_collections(uid, REC_COLLECTION_LOOKBACK)
     if user_cols:
         # map candidate item_id -> collections set
@@ -236,16 +318,13 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
         subset["collections_set"] = subset["collections_csv"].fillna("").map(_parse_csv_set)
         col_map = dict(zip(subset["item_id"], subset["collections_set"]))
 
-        # compute binary boost if any intersection with user's collections
-        boost_mask = np.array([
-            1.0 if (col_map.get(cid) and (col_map[cid] & user_cols)) else 0.0
-            for cid in cand_ids
-        ], dtype=np.float32)
+        boost_mask = np.array(
+            [1.0 if (col_map.get(cid) and (col_map[cid] & user_cols)) else 0.0 for cid in cand_ids],
+            dtype=np.float32,
+        )
 
         scores = scores + REC_COLLECTION_BOOST * boost_mask
-        if explain:
-            # we’ll annotate later per item if it received a boost
-            boosted_set = {cid for cid, m in zip(cand_ids, boost_mask) if m > 0}
+        boosted_set = {cid for cid, m in zip(cand_ids, boost_mask) if m > 0} if explain else set()
     else:
         boosted_set = set()
 
@@ -259,52 +338,33 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
     pct = _percentile(scores)
     k = max(int(k), 1)
     topk_local = np.argsort(-scores)[:k]
+
     picks_idx = [unwatched_idx[i] for i in topk_local]
     picks_ids = [id_index[i] for i in picks_idx]
     picks_pct = [float(pct[i]) for i in topk_local]
     picks_scores = [float(scores[i]) for i in topk_local]
 
     ord_map = {iid: i for i, iid in enumerate(picks_ids)}
-    out = (df_items[df_items["item_id"].isin(picks_ids)]
+    view = (
+        df_items[df_items["item_id"].isin(picks_ids)]
         .assign(__o=lambda d: d["item_id"].map(ord_map))
-        .sort_values("__o"))
+        .sort_values("__o")
+    )
 
     pct_map = dict(zip(picks_ids, picks_pct))
-    sc_map  = dict(zip(picks_ids, picks_scores))
+    sc_map = dict(zip(picks_ids, picks_scores))
     max_pct_value = max(pct_map.values()) if pct_map else 0.0
 
-    # explain blocks
+    # explain blocks (match features.py)
     blocks_slices = None
     if explain:
-        # reconstruct block layout
-        def _feature_blocks(vecs: dict) -> list[tuple[str, int]]:
-            blocks = []
-            def add(name_key, label):
-                v = vecs.get(name_key)
-                size = len(getattr(v, "vocabulary_", {}) or {}) if v is not None else 0
-                if size > 0:
-                    blocks.append((label, size))
-            add("vec_collections", "collections")
-            add("vec_genres", "genres")
-            add("vec_people", "people")
-            add("vec_text", "text")
-            add("vec_year", "year")
-            return blocks
-
-        def _block_slices(blocks):
-            out, start = [], 0
-            for name, size in blocks:
-                stop = start + int(size)
-                out.append((name, slice(start, stop)))
-                start = stop
-            return out
-
-        blocks_slices = _block_slices(_feature_blocks(vecs))
+        blocks_slices = _block_slices(_feature_blocks_from_vecs(vecs))
 
     results = []
-    for r in out.itertuples():
+    for r in view.itertuples():
         pct_val = float(pct_map[r.item_id])
         match_pct = 100 if pct_val >= max_pct_value else int(np.floor(100.0 * pct_val))
+
         rec = {
             "item_id": r.item_id,
             "title": r.title,
@@ -312,12 +372,13 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
             "genres": (r.genres_csv or ""),
             "collections": (r.collections_csv or ""),
             "poster": r.poster_url,
+            "media_type": (r.media_type or None),
             "relevancy": match_pct,
-            "score": round(sc_map[r.item_id], 4)
+            "score": round(sc_map[r.item_id], 4),
         }
+
         if explain and blocks_slices:
             row_dense = X[picks_idx[ord_map[r.item_id]]].toarray().ravel()
-            # per-block contributions
             total = sc_map[r.item_id]
             eps = 1e-12
             expl = {}
@@ -326,18 +387,25 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
                 pct_contrib = (c / (total + eps)) * 100.0 if total > 0 else 0.0
                 expl[name] = {"contribution": round(c, 6), "percent_of_score": round(pct_contrib, 2)}
             if r.item_id in boosted_set:
-                base = sc_map[r.item_id]
-                total_after = base + REC_COLLECTION_BOOST
+                # show boost as % of final score (post-boost), which avoids "None%"
+                total_after = total + REC_COLLECTION_BOOST
                 pct_boost = (REC_COLLECTION_BOOST / max(total_after, 1e-12)) * 100.0
-                expl["collections_rerank_boost"] = {"contribution": REC_COLLECTION_BOOST, "percent_of_score": round(pct_boost, 2)}
+                expl["collections_rerank_boost"] = {
+                    "contribution": REC_COLLECTION_BOOST,
+                    "percent_of_score": round(pct_boost, 2),
+                }
             rec["explain"] = expl
 
         results.append(rec)
+
     if results:
         best = max(picks_scores) if picks_scores else float("nan")
         median = float(np.median(scores)) if scores.size else float("nan")
-        log.info("Recs for query=%r resolved uid=%s: candidates=%d topK=%d best_cos=%.4f median_cos=%.4f",
-                 user_query, uid, len(unwatched_idx), len(results), best, median)
+        log.info(
+            "Recs for query=%r resolved uid=%s: candidates=%d topK=%d best_cos=%.4f median_cos=%.4f (media_type=%s)",
+            user_query, uid, len(unwatched_idx), len(results), best, median, media_type or "any",
+        )
     else:
-        log.info("Recs for query=%r resolved uid=%s: no results", user_query, uid)
+        log.info("Recs for query=%r resolved uid=%s: no results (media_type=%s)", user_query, uid, media_type or "any")
+
     return results

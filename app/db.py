@@ -39,6 +39,24 @@ def ensure_schema():
             log.info("Migrating: add users.display_name")
             con.exec_driver_sql("ALTER TABLE users ADD COLUMN display_name TEXT;")
 
+        if not _column_exists(con, "items", "media_type"):
+            log.info("Migrating: add items.media_type")
+            con.exec_driver_sql("ALTER TABLE items ADD COLUMN media_type TEXT;")
+
+        if not _column_exists(con, "items", "tmdb_id"):
+             log.info("Migrating: add items.tmdb_id")
+             con.exec_driver_sql("ALTER TABLE items ADD COLUMN tmdb_id INTEGER;")
+
+        if not _column_exists(con, "items", "keywords_csv"):
+            log.info("Migrating: add items.keywords_csv")
+            con.exec_driver_sql("ALTER TABLE items ADD COLUMN keywords_csv TEXT;")
+
+        # helpful index
+        try:
+            con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_items_media_type ON items(media_type);")
+        except Exception:
+            pass
+
         # Allow multiple managed/guest entries with empty username
         try:
             con.exec_driver_sql("UPDATE users SET user_name = NULL WHERE user_name = ''")
