@@ -9,12 +9,19 @@ CREATE TABLE IF NOT EXISTS watch_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id TEXT, user_name TEXT,
   item_id TEXT,
+  plex_history_key TEXT,
   started_at TEXT, stopped_at TEXT,
   duration INTEGER, view_offset INTEGER,
   completed INTEGER,
   source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_we_user_time ON watch_events(user_id, started_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uix_we_source_plex_history_key
+  ON watch_events(source, plex_history_key)
+  WHERE plex_history_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uix_we_fallback
+  ON watch_events(user_id, item_id, started_at, source)
+  WHERE plex_history_key IS NULL;
 
 CREATE TABLE IF NOT EXISTS user_item_pref(
   user_id TEXT, item_id TEXT, preference REAL, last_seen_at TEXT,
