@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS items(
   summary TEXT, genres_csv TEXT, cast_csv TEXT,
   directors_csv TEXT, collections_csv TEXT, poster_path TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_items_item_id ON items(item_id);
 
 CREATE TABLE IF NOT EXISTS watch_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -16,6 +17,8 @@ CREATE TABLE IF NOT EXISTS watch_events(
   source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_we_user_time ON watch_events(user_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_we_user_item_started_desc ON watch_events(user_id, item_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_we_id ON watch_events(id);
 CREATE UNIQUE INDEX IF NOT EXISTS uix_we_source_plex_history_key
   ON watch_events(source, plex_history_key)
   WHERE plex_history_key IS NOT NULL;
@@ -27,6 +30,7 @@ CREATE TABLE IF NOT EXISTS user_item_pref(
   user_id TEXT, item_id TEXT, preference REAL, last_seen_at TEXT,
   PRIMARY KEY (user_id, item_id)
 );
+CREATE INDEX IF NOT EXISTS idx_uip_user_last_seen_item ON user_item_pref(user_id, last_seen_at DESC, item_id);
 
 CREATE TABLE IF NOT EXISTS users(
   user_id TEXT PRIMARY KEY,
