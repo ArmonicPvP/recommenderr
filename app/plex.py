@@ -14,7 +14,7 @@ def strip_plex_token(value: str | None) -> str | None:
     parts = urlsplit(value)
     if not parts.query:
         return value
-    cleaned = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "X-Plex-Token"]
+    cleaned = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "x-plex-token"]
     query = urlencode(cleaned, doseq=True)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 

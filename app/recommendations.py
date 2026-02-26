@@ -4,19 +4,19 @@ import pandas as pd
 import scipy.sparse as sp
 from .db import engine
 from .features import load_artifacts
-from .config import PLEX_BASE, PLEX_TOKEN, REC_COLLECTION_BOOST, REC_COLLECTION_LOOKBACK
+from .config import PLEX_BASE, REC_COLLECTION_BOOST, REC_COLLECTION_LOOKBACK
+from .plex import strip_plex_token
 
 log = logging.getLogger(__name__)
 
 
-def _build_poster_url(poster_path: str | None, include_auth_token: bool = False) -> str | None:
+def _build_poster_url(poster_path: str | None) -> str | None:
     if not poster_path:
         return None
-    base = f"{PLEX_BASE}{poster_path}"
-    if include_auth_token and PLEX_TOKEN:
-        joiner = "&" if "?" in poster_path else "?"
-        return f"{base}{joiner}X-Plex-Token={PLEX_TOKEN}"
-    return base
+    cleaned = strip_plex_token(str(poster_path))
+    if not cleaned:
+        return None
+    return f"{PLEX_BASE}{cleaned}"
 
 def _get_user_row(query: str):
     with engine().begin() as con:
@@ -195,7 +195,7 @@ def _recent_user_collections(user_id: str, lookback: int) -> set[str]:
     return cols
 
 """Return top-K recommendations for a user."""
-def recommend_for_username(user_query: str, k: int = 10, explain: bool = False, include_auth_token: bool = False):
+def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
     try:
         vecs, X, id_index = load_artifacts()
     except Exception as e:
@@ -321,7 +321,7 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False, 
             "year": r.year,
             "genres": (r.genres_csv or ""),
             "collections": (r.collections_csv or ""),
-            "poster": _build_poster_url(r.poster_path, include_auth_token=include_auth_token),
+            "poster": _build_poster_url(r.poster_path),
             "relevancy": match_pct,
             "score": round(sc_map[r.item_id], 4)
         }
