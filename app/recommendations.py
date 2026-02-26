@@ -209,7 +209,12 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
 
     with engine().begin() as con:
         df_w = pd.read_sql_query(
-            "SELECT DISTINCT item_id FROM watch_events WHERE user_id=:u",
+            """
+            SELECT item_id
+            FROM watch_events
+            WHERE user_id=:u
+            GROUP BY item_id
+            """,
             con, params={"u": uid}
         )
         watched = set(df_w["item_id"].astype(str).tolist())

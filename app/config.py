@@ -1,9 +1,11 @@
 import os
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 load_dotenv()
 
 PLEX_BASE = os.getenv("PLEX_BASE", "http://localhost:32400").rstrip("/")
 PLEX_TOKEN = os.getenv("PLEX_TOKEN", "")
+ALLOW_INSECURE_PLEX_HTTP = os.getenv("ALLOW_INSECURE_PLEX_HTTP", "false").lower() in ("1", "true", "yes")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
 DB_PATH = os.getenv("DB_PATH", "/data/recommendations.db")
@@ -35,3 +37,23 @@ YEAR_MIN           = int(os.getenv("YEAR_MIN", "1900"))
 YEAR_MAX           = int(os.getenv("YEAR_MAX", "2030"))
 
 assert PLEX_TOKEN, "Set PLEX_TOKEN"
+
+
+def _is_localhost(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    host = hostname.strip().lower()
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+_plex_base = urlparse(PLEX_BASE)
+if _plex_base.scheme == "http" and not _is_localhost(_plex_base.hostname):
+    msg = (
+        "Insecure Plex config detected: PLEX_BASE uses non-localhost HTTP while token auth is enabled. "
+        "Use an https:// Plex endpoint with a trusted certificate, or set "
+        "ALLOW_INSECURE_PLEX_HTTP=true to explicitly allow insecure home-network HTTP."
+    )
+    if ALLOW_INSECURE_PLEX_HTTP:
+        print(f"WARNING: {msg}")
+    else:
+        raise RuntimeError(msg)

@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 
 from .config import DB_PATH
@@ -18,6 +18,15 @@ def engine() -> Engine:
     if _engine is None:
         log.info("Initializing SQLite engine at %s", DB_PATH)
         _engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA temp_store=MEMORY")
+            cursor.execute("PRAGMA cache_size=-20000")
+            cursor.close()
     return _engine
 
 
@@ -165,6 +174,14 @@ def ensure_schema():
             con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_items_year ON items(year)")
             con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_items_tmdb ON items(tmdb_id)")
             con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_pref_user ON user_item_pref(user_id)")
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_we_user_item_started_desc ON watch_events(user_id, item_id, started_at DESC)"
+            )
+            con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_we_id ON watch_events(id)")
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_uip_user_last_seen_item ON user_item_pref(user_id, last_seen_at DESC, item_id)"
+            )
+            con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_items_item_id ON items(item_id)")
         except Exception:
             pass
 

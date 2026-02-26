@@ -69,16 +69,37 @@ Runs as a single Docker container, stores artifacts on a bind-mounted `/data`, a
 Create a `.env` next to your Compose file or inject as container env.
 See `.env.example` for defaults.
 
-| Variable            | Default                    | Notes                                       |
-| ------------------- | -------------------------- | ------------------------------------------- |
-| `PLEX_BASE`         | `http://localhost:32400`   | Your PMS URL                                |
-| `PLEX_TOKEN`        | *(required)*               | Plex auth token                             |
-| `DB_PATH`           | `/data/recommendations.db` | SQLite path                                 |
-| `ART_DIR`           | `/data`                    | Where vector artifacts are stored           |
-| `PULL_INTERVAL_MIN` | `60`                       | Scheduler interval (minutes)                |
-| `DISABLE_AUTOSTART` | `false`                    | Skip auto-pipeline on start (useful in dev) |
-| `LOG_LEVEL`         | `INFO`                     | `DEBUG` for more detail                     |
-| `LOG_FILE`          | `/data/recommenderr.log`   | Rotating log file                           |
+| Variable                        | Default                    | Notes                                                                 |
+| ------------------------------- | -------------------------- | --------------------------------------------------------------------- |
+| `PLEX_BASE`                     | `http://localhost:32400`   | Prefer `https://...` for any non-localhost PMS endpoint              |
+| `PLEX_TOKEN`                    | *(required)*               | Plex auth token                                                       |
+| `ALLOW_INSECURE_PLEX_HTTP`      | `false`                    | Set `true` to explicitly allow non-localhost `http://` with token auth |
+| `DB_PATH`                       | `/data/recommendations.db` | SQLite path                                                           |
+| `ART_DIR`                       | `/data`                    | Where vector artifacts are stored                                     |
+| `PULL_INTERVAL_MIN`             | `60`                       | Scheduler interval (minutes)                                          |
+| `DISABLE_AUTOSTART`             | `false`                    | Skip auto-pipeline on start (useful in dev)                           |
+| `LOG_LEVEL`                     | `INFO`                     | `DEBUG` for more detail                                               |
+| `LOG_FILE`                      | `/data/recommenderr.log`   | Rotating log file                                                     |
+
+### Plex endpoint security expectations
+
+- For remote/non-local Plex servers, configure `PLEX_BASE` with `https://` and a certificate trusted by the container host.
+- Plain `http://` is only intended for loopback/local development (`localhost`, `127.0.0.1`, `::1`).
+- On startup, Recommenderr now hard-fails if `PLEX_BASE` is non-localhost HTTP while `PLEX_TOKEN` is set, unless you explicitly opt in with `ALLOW_INSECURE_PLEX_HTTP=true`.
+- If you must run insecure HTTP on a trusted home LAN segment, set `ALLOW_INSECURE_PLEX_HTTP=true` so the risk is explicit and logged as a warning.
+
+### Docker runtime user and `/data` permissions
+
+The container creates and runs as an unprivileged `appuser` by default.
+
+- Username: `appuser`
+- UID: `10001` (override with build arg `APP_UID`)
+- GID: `10001` (override with build arg `APP_GID`)
+
+The application needs write access to `/data` for SQLite, logs, and artifacts.
+When using bind mounts, ensure the host directory is writable by the same UID/GID
+(or adjust ownership/ACLs accordingly).
+
 
 **Feature weights:**
 
