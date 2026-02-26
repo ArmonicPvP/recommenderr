@@ -18,7 +18,14 @@ CREATE INDEX IF NOT EXISTS idx_we_user_time ON watch_events(user_id, started_at)
 
 CREATE TABLE IF NOT EXISTS user_item_pref(
   user_id TEXT, item_id TEXT, preference REAL, last_seen_at TEXT,
+  event_count INTEGER DEFAULT 0,
+  max_duration INTEGER DEFAULT 0,
   PRIMARY KEY (user_id, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_state(
+  key TEXT PRIMARY KEY,
+  value TEXT
 );
 
 CREATE TABLE IF NOT EXISTS users(

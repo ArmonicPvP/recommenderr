@@ -49,16 +49,38 @@ def _ts_to_iso_utc(ts):
     except Exception:
         return str(ts)
 
-def _preference(grp: pd.DataFrame) -> float:
-    events = len(grp)
-    started = pd.to_datetime(grp["started_at"], utc=True, errors="coerce")
-    last_seen = started.max()
-    days = 999.0 if pd.isna(last_seen) else (pd.Timestamp.utcnow() - last_seen).days
-    recent = math.exp(-days / 90.0)
-    dur = grp["duration"].dropna()
-    dur_score = min(dur.max() / 1800.0, 1.0) if not dur.empty else 0.5
-    w_amt, w_rec, w_dur, w_bias = 0.55, 0.30, 0.10, 0.05
-    return w_amt * math.log1p(events) + w_rec * recent + w_dur * dur_score + w_bias
+PREF_WEIGHTS = {
+    "w_amt": 0.55,
+    "w_rec": 0.30,
+    "w_dur": 0.10,
+    "w_bias": 0.05,
+}
+
+
+def _compute_preferences(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    out["event_count"] = pd.to_numeric(out["event_count"], errors="coerce").fillna(0)
+    out["max_duration"] = pd.to_numeric(out["max_duration"], errors="coerce").fillna(0)
+
+    last_seen = pd.to_datetime(out["last_seen_at"], utc=True, errors="coerce")
+    now = pd.Timestamp.utcnow()
+    days_since = (now - last_seen).dt.total_seconds().div(86400.0).fillna(999.0)
+
+    recent = (-days_since / 90.0).map(math.exp)
+    dur_score = (out["max_duration"] / 1800.0).clip(lower=0.0, upper=1.0)
+
+    out["preference"] = (
+        PREF_WEIGHTS["w_amt"] * out["event_count"].map(math.log1p)
+        + PREF_WEIGHTS["w_rec"] * recent
+        + PREF_WEIGHTS["w_dur"] * dur_score
+        + PREF_WEIGHTS["w_bias"]
+    )
+    out["last_seen_at"] = last_seen.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return out
+
 
 def ingest_once():
     """Sync users and ingest canonical watch history; upsert item metadata."""
@@ -224,47 +246,97 @@ def _backfill_missing_items():
     return filled
 
 def rebuild_prefs_and_vectors():
-    """Recompute user_item_pref and rebuild item vectors."""
-    
+    """Incrementally recompute user_item_pref and rebuild item vectors."""
+    ensure_schema()
 
     with engine().begin() as con:
         try:
             _enrich_keywords_if_possible()
         except Exception as e:
             log.warning("Keyword enrichment skipped: %s", e)
-        items = pd.read_sql_query(
-            """
-            SELECT item_id, title, summary, year,
-                genres_csv, cast_csv, directors_csv, collections_csv,
-                countries_csv, content_rating, keywords_csv
-            FROM items
-            """,
-            con,
-    )
 
+        last_seen_id_raw = con.exec_driver_sql(
+            "SELECT value FROM pipeline_state WHERE key='prefs_last_event_id'"
+        ).scalar()
+        try:
+            last_seen_id = int(last_seen_id_raw) if last_seen_id_raw is not None else 0
+        except Exception:
+            last_seen_id = 0
 
-        df_we = pd.read_sql_query("SELECT user_id,item_id,started_at,duration FROM watch_events", con)
-        if not df_we.empty:
-            rows = []
-            for (u, i), grp in df_we.groupby(["user_id", "item_id"]):
-                rows.append({
-                    "user_id": u,
-                    "item_id": i,
-                    "preference": _preference(grp),
-                    "last_seen_at": pd.to_datetime(grp["started_at"], utc=True, errors="coerce").max(),
-                })
-            df_pref = pd.DataFrame(rows)
-            df_pref["last_seen_at"] = df_pref["last_seen_at"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        max_event_id = con.exec_driver_sql("SELECT COALESCE(MAX(id), 0) FROM watch_events").scalar() or 0
+
+        changed_pref_rows = pd.DataFrame()
+        if int(max_event_id) > last_seen_id:
+            con.exec_driver_sql("DROP TABLE IF EXISTS tmp_pref_agg")
+            con.exec_driver_sql(
+                """
+                CREATE TEMP TABLE tmp_pref_agg AS
+                SELECT
+                    user_id,
+                    item_id,
+                    COUNT(*) AS event_count,
+                    MAX(COALESCE(duration, 0)) AS max_duration,
+                    MAX(started_at) AS last_seen_at
+                FROM watch_events
+                WHERE id > :last_id
+                GROUP BY user_id, item_id
+                """,
+                {"last_id": last_seen_id},
+            )
+
+            con.exec_driver_sql(
+                """
+                INSERT INTO user_item_pref(user_id, item_id, preference, last_seen_at, event_count, max_duration)
+                SELECT user_id, item_id, 0.0, last_seen_at, event_count, max_duration
+                FROM tmp_pref_agg
+                ON CONFLICT(user_id,item_id) DO UPDATE SET
+                  event_count=user_item_pref.event_count + excluded.event_count,
+                  max_duration=MAX(user_item_pref.max_duration, excluded.max_duration),
+                  last_seen_at=MAX(user_item_pref.last_seen_at, excluded.last_seen_at)
+                """
+            )
+
+            changed_pref_rows = pd.read_sql_query(
+                """
+                SELECT p.user_id, p.item_id, p.event_count, p.max_duration, p.last_seen_at
+                FROM user_item_pref p
+                INNER JOIN tmp_pref_agg t
+                  ON t.user_id = p.user_id AND t.item_id = p.item_id
+                """,
+                con,
+            )
+
+            con.exec_driver_sql(
+                """
+                INSERT INTO pipeline_state(key, value)
+                VALUES ('prefs_last_event_id', :max_id)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                {"max_id": str(max_event_id)},
+            )
+            con.exec_driver_sql("DROP TABLE IF EXISTS tmp_pref_agg")
+
+        if not changed_pref_rows.empty:
+            df_pref = _compute_preferences(changed_pref_rows)
             for _, r in df_pref.iterrows():
                 con.exec_driver_sql(
                     """
-                    INSERT INTO user_item_pref(user_id,item_id,preference,last_seen_at)
-                    VALUES (:u,:i,:p,:t)
+                    INSERT INTO user_item_pref(user_id,item_id,preference,last_seen_at,event_count,max_duration)
+                    VALUES (:u,:i,:p,:t,:ec,:md)
                     ON CONFLICT(user_id,item_id) DO UPDATE SET
                       preference=excluded.preference,
-                      last_seen_at=excluded.last_seen_at
+                      last_seen_at=excluded.last_seen_at,
+                      event_count=excluded.event_count,
+                      max_duration=excluded.max_duration
                     """,
-                    {"u": r.user_id, "i": r.item_id, "p": float(r.preference), "t": r.last_seen_at},
+                    {
+                        "u": r.user_id,
+                        "i": r.item_id,
+                        "p": float(r.preference),
+                        "t": r.last_seen_at,
+                        "ec": int(r.event_count),
+                        "md": int(r.max_duration),
+                    },
                 )
 
         items = pd.read_sql_query(

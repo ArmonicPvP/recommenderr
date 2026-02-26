@@ -57,6 +57,15 @@ def ensure_schema():
                 log.info("Migrating: add items.%s", col)
                 con.exec_driver_sql(ddl)
 
+        pref_migrations = [
+            ("event_count", "ALTER TABLE user_item_pref ADD COLUMN event_count INTEGER DEFAULT 0"),
+            ("max_duration", "ALTER TABLE user_item_pref ADD COLUMN max_duration INTEGER DEFAULT 0"),
+        ]
+        for col, ddl in pref_migrations:
+            if not _column_exists(con, "user_item_pref", col):
+                log.info("Migrating: add user_item_pref.%s", col)
+                con.exec_driver_sql(ddl)
+
         # Helpful indexes (idempotent; ignore errors if present)
         try:
             con.exec_driver_sql(
@@ -67,6 +76,9 @@ def ensure_schema():
             )
             con.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS idx_pref_user ON user_item_pref(user_id)"
+            )
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_we_id ON watch_events(id)"
             )
         except Exception:
             pass
