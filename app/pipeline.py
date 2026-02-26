@@ -64,6 +64,13 @@ def ingest_once():
     """Sync users and ingest canonical watch history; upsert item metadata."""
     ensure_schema()
     t0 = time.time()
+    required_fields = ("type", "title", "summary", "genres_csv")
+
+    def _needs_metadata_refresh(existing_row):
+        if not existing_row:
+            return True
+        return any(existing_row.get(field) in (None, "") for field in required_fields)
+
     with engine().begin() as con:
         # 1) Sync users and find admin uid
         user_map = {}
@@ -105,6 +112,10 @@ def ingest_once():
 
         # 2) Ingest history; also rewrite incoming '1' to admin_uid immediately
         count = 0
+        history_rows = []
+        distinct_item_ids = set()
+        duplicate_item_hits = 0
+        metadata_cache = {}
         for row in iter_history():
             raw_uid = str(row.get("user_id") or "")
             uid = admin_uid if (raw_uid == "1" and admin_uid) else raw_uid
@@ -119,7 +130,24 @@ def ingest_once():
 
             started_iso = _ts_to_iso_utc(row.get("started_at"))
             stopped_iso = _ts_to_iso_utc(row.get("stopped_at"))
+            history_rows.append(
+                {
+                    "uid": uid,
+                    "uname": friendly,
+                    "iid": item_id,
+                    "st": started_iso,
+                    "sp": stopped_iso,
+                    "dur": row.get("duration") or 0,
+                    "off": row.get("view_offset") or 0,
+                }
+            )
+            if item_id in distinct_item_ids:
+                duplicate_item_hits += 1
+            else:
+                distinct_item_ids.add(item_id)
+            count += 1
 
+        for event in history_rows:
             con.exec_driver_sql(
                 """
                 INSERT INTO watch_events(
@@ -129,30 +157,61 @@ def ingest_once():
                 )
                 VALUES (:uid, :uname, :iid, :st, :sp, :dur, :off, 1, 'plex')
                 """,
-                {
-                    "uid": uid,
-                    "uname": friendly,
-                    "iid": item_id,
-                    "st": started_iso,
-                    "sp": stopped_iso,
-                    "dur": row.get("duration") or 0,
-                    "off": row.get("view_offset") or 0,
-                },
+                event,
             )
 
+        existing_items = {}
+        if distinct_item_ids:
+            placeholders = ",".join([":iid_" + str(i) for i in range(len(distinct_item_ids))])
+            params = {"iid_" + str(i): iid for i, iid in enumerate(distinct_item_ids)}
+            rows = con.exec_driver_sql(
+                f"""
+                SELECT item_id, type, title, summary, genres_csv
+                FROM items
+                WHERE item_id IN ({placeholders})
+                """,
+                params,
+            ).mappings().all()
+            existing_items = {str(r["item_id"]): dict(r) for r in rows}
+
+        fetch_count = 0
+        skipped_existing = 0
+        for item_id in distinct_item_ids:
+            existing = existing_items.get(str(item_id))
+            if not _needs_metadata_refresh(existing):
+                skipped_existing += 1
+                continue
+            if item_id in metadata_cache:
+                continue
             md = fetch_metadata(item_id)
-            if md:
-                cols = ",".join(md.keys())
-                placeholders = ",".join(":" + k for k in md.keys())
-                sets = ",".join([f"{k}=excluded.{k}" for k in md.keys() if k != "item_id"])
-                con.exec_driver_sql(
-                    f"INSERT INTO items({cols}) VALUES ({placeholders}) "
-                    f"ON CONFLICT(item_id) DO UPDATE SET {sets}",
-                    md,
-                )
-            count += 1
+            if not md:
+                continue
+            metadata_cache[item_id] = md
+            fetch_count += 1
+
+        upserted = 0
+        for md in metadata_cache.values():
+            cols = ",".join(md.keys())
+            placeholders = ",".join(":" + k for k in md.keys())
+            sets = ",".join([f"{k}=excluded.{k}" for k in md.keys() if k != "item_id"])
+            con.exec_driver_sql(
+                f"INSERT INTO items({cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT(item_id) DO UPDATE SET {sets}",
+                md,
+            )
+            upserted += 1
     dt_ms = int((time.time() - t0) * 1000)
-    log.info("Ingest complete: %d history rows in %dms", count, dt_ms)
+    log.info(
+        "Ingest complete: %d history rows in %dms (distinct_item_ids=%d, metadata_fetched=%d, "
+        "metadata_cache_hits=%d, existing_item_skips=%d, metadata_upserts=%d)",
+        count,
+        dt_ms,
+        len(distinct_item_ids),
+        fetch_count,
+        duplicate_item_hits,
+        skipped_existing,
+        upserted,
+    )
     return count
 
 def scan_library_all():
