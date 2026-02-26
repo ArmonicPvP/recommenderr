@@ -4,7 +4,13 @@ import pandas as pd
 import scipy.sparse as sp
 from .db import engine
 from .features import load_artifacts
-from .config import REC_COLLECTION_BOOST, REC_COLLECTION_LOOKBACK
+from .config import (
+    REC_COLLECTION_BOOST,
+    REC_COLLECTION_LOOKBACK,
+    REC_TWO_STAGE_THRESHOLD,
+    REC_CANDIDATE_MULTIPLIER,
+    REC_MIN_CANDIDATES,
+)
 
 log = logging.getLogger(__name__)
 
@@ -184,10 +190,116 @@ def _recent_user_collections(user_id: str, lookback: int) -> set[str]:
             cols.update(_parse_csv_set(s))
     return cols
 
+
+def _top_n_blockwise(C: sp.csr_matrix, uvec: np.ndarray, n: int, block_size: int = 20000) -> tuple[np.ndarray, np.ndarray]:
+    if C.shape[0] == 0 or n <= 0:
+        return np.array([], dtype=int), np.array([], dtype=np.float32)
+
+    n = min(int(n), C.shape[0])
+    best_scores = np.array([], dtype=np.float32)
+    best_idx = np.array([], dtype=int)
+
+    for start in range(0, C.shape[0], block_size):
+        stop = min(start + block_size, C.shape[0])
+        block_scores = np.asarray(C[start:stop].dot(uvec)).ravel().astype(np.float32, copy=False)
+        if block_scores.size == 0:
+            continue
+        take = min(n, block_scores.size)
+        local_order = np.argpartition(-block_scores, take - 1)[:take]
+        local_scores = block_scores[local_order]
+        local_idx = local_order + start
+
+        if best_scores.size == 0:
+            best_scores, best_idx = local_scores, local_idx
+        else:
+            best_scores = np.concatenate([best_scores, local_scores])
+            best_idx = np.concatenate([best_idx, local_idx])
+
+        if best_scores.size > n:
+            keep = np.argpartition(-best_scores, n - 1)[:n]
+            best_scores = best_scores[keep]
+            best_idx = best_idx[keep]
+
+    if best_scores.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=np.float32)
+
+    order = np.argsort(-best_scores)
+    return best_idx[order], best_scores[order]
+
+
+def _two_stage_candidates(
+    X: sp.csr_matrix,
+    id_index: list[str],
+    watched: set[str],
+    uvec: np.ndarray,
+    k: int,
+    nn_artifact: dict | None,
+) -> tuple[list[int], np.ndarray, np.ndarray, str]:
+    unwatched_idx = [i for i, iid in enumerate(id_index) if iid not in watched]
+    if not unwatched_idx:
+        return [], np.array([], dtype=np.float32), np.array([], dtype=np.float32), "none"
+
+    use_two_stage = len(unwatched_idx) >= REC_TWO_STAGE_THRESHOLD
+    candidate_target = min(
+        len(unwatched_idx),
+        max(int(k) * max(REC_CANDIDATE_MULTIPLIER, 1), REC_MIN_CANDIDATES),
+    )
+
+    if not use_two_stage:
+        C = X[unwatched_idx]
+        scores = np.asarray(C.dot(uvec)).ravel()
+        return unwatched_idx, scores, scores, "full_exact"
+
+    candidate_locals = np.array([], dtype=int)
+    method = "blockwise"
+    nn_index = (nn_artifact or {}).get("nn_index") if isinstance(nn_artifact, dict) else None
+
+    if nn_index is not None:
+        request_k = min(X.shape[0], max(candidate_target + len(watched), candidate_target))
+        _, inds = nn_index.kneighbors(uvec.reshape(1, -1), n_neighbors=request_k, return_distance=True)
+        selected = []
+        for raw_idx in inds[0].tolist():
+            iid = id_index[int(raw_idx)]
+            if iid in watched:
+                continue
+            selected.append(int(raw_idx))
+            if len(selected) >= candidate_target:
+                break
+        if selected:
+            candidate_locals = np.array(selected, dtype=int)
+            method = "nn_index"
+
+    if candidate_locals.size == 0:
+        C = X[unwatched_idx]
+        local_idx, _ = _top_n_blockwise(C, uvec, candidate_target)
+        candidate_locals = local_idx.astype(int, copy=False)
+
+    candidate_global = [unwatched_idx[i] for i in candidate_locals.tolist()]
+    if not candidate_global:
+        return [], np.array([], dtype=np.float32), np.array([], dtype=np.float32), method
+
+    Ccand = X[candidate_global]
+    scores = np.asarray(Ccand.dot(uvec)).ravel()
+    return candidate_global, scores, scores.copy(), method
+
+
+def _load_items_metadata(item_ids: list[str]) -> pd.DataFrame:
+    if not item_ids:
+        return pd.DataFrame(columns=["item_id", "title", "year", "genres_csv", "collections_csv", "poster_url"])
+    placeholders = ",".join([":id" + str(i) for i in range(len(item_ids))])
+    params = {"id" + str(i): iid for i, iid in enumerate(item_ids)}
+    query = f"""
+        SELECT item_id, title, year, genres_csv, collections_csv, poster_url
+        FROM items
+        WHERE item_id IN ({placeholders})
+    """
+    with engine().begin() as con:
+        return pd.read_sql_query(query, con, params=params)
+
 """Return top-K recommendations for a user."""
 def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
     try:
-        vecs, X, id_index = load_artifacts()
+        vecs, X, id_index, nn_artifact = load_artifacts()
     except Exception as e:
         log.error("Artifacts not loaded: %s", e)
         return []
@@ -203,10 +315,6 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
             con, params={"u": uid}
         )
         watched = set(df_w["item_id"].astype(str).tolist())
-        df_items = pd.read_sql_query(
-            "SELECT item_id, title, year, genres_csv, collections_csv, poster_url FROM items",
-            con
-        )
     if df_w.empty:
         log.info("User %s has no watch history yet (uid=%s)",
                  info.get("user_name") or info.get("display_name") or user_query, uid)
@@ -218,25 +326,29 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
         log.info("User %s has no preference vector yet (uid=%s)", user_query, uid)
         return []
 
-    # Candidate rows (unwatched)
-    unwatched_idx = [i for i, iid in enumerate(id_index) if iid not in watched]
-    if not unwatched_idx:
+    # Candidate rows (unwatched) with optional two-stage retrieval
+    k = max(int(k), 1)
+    candidate_idx, scores, base_scores, candidate_method = _two_stage_candidates(
+        X=X,
+        id_index=id_index,
+        watched=watched,
+        uvec=uvec,
+        k=k,
+        nn_artifact=nn_artifact,
+    )
+    if not candidate_idx:
         log.info("No unwatched candidates for uid=%s", uid)
         return []
 
-    C = X[unwatched_idx]
-    scores = np.asarray(C.dot(uvec)).ravel()
+    cand_ids = [id_index[i] for i in candidate_idx]
 
     # --- Collections rerank boost ---
     user_cols = _recent_user_collections(uid, REC_COLLECTION_LOOKBACK)
     if user_cols:
-        # map candidate item_id -> collections set
-        cand_ids = [id_index[i] for i in unwatched_idx]
-        subset = df_items[df_items["item_id"].isin(cand_ids)][["item_id", "collections_csv"]].copy()
-        subset["collections_set"] = subset["collections_csv"].fillna("").map(_parse_csv_set)
-        col_map = dict(zip(subset["item_id"], subset["collections_set"]))
+        cand_meta = _load_items_metadata(cand_ids)[["item_id", "collections_csv"]].copy()
+        cand_meta["collections_set"] = cand_meta["collections_csv"].fillna("").map(_parse_csv_set)
+        col_map = dict(zip(cand_meta["item_id"], cand_meta["collections_set"]))
 
-        # compute binary boost if any intersection with user's collections
         boost_mask = np.array([
             1.0 if (col_map.get(cid) and (col_map[cid] & user_cols)) else 0.0
             for cid in cand_ids
@@ -244,7 +356,6 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
 
         scores = scores + REC_COLLECTION_BOOST * boost_mask
         if explain:
-            # we’ll annotate later per item if it received a boost
             boosted_set = {cid for cid, m in zip(cand_ids, boost_mask) if m > 0}
     else:
         boosted_set = set()
@@ -257,20 +368,22 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
         return ranks / max(len(x) - 1, 1)
 
     pct = _percentile(scores)
-    k = max(int(k), 1)
     topk_local = np.argsort(-scores)[:k]
-    picks_idx = [unwatched_idx[i] for i in topk_local]
+    picks_idx = [candidate_idx[i] for i in topk_local]
     picks_ids = [id_index[i] for i in picks_idx]
     picks_pct = [float(pct[i]) for i in topk_local]
     picks_scores = [float(scores[i]) for i in topk_local]
+    picks_base_scores = [float(base_scores[i]) for i in topk_local]
 
     ord_map = {iid: i for i, iid in enumerate(picks_ids)}
-    out = (df_items[df_items["item_id"].isin(picks_ids)]
+    pick_items = _load_items_metadata(picks_ids)
+    out = (pick_items[pick_items["item_id"].isin(picks_ids)]
         .assign(__o=lambda d: d["item_id"].map(ord_map))
         .sort_values("__o"))
 
     pct_map = dict(zip(picks_ids, picks_pct))
     sc_map  = dict(zip(picks_ids, picks_scores))
+    base_map = dict(zip(picks_ids, picks_base_scores))
     max_pct_value = max(pct_map.values()) if pct_map else 0.0
 
     # explain blocks
@@ -287,8 +400,12 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
             add("vec_collections", "collections")
             add("vec_genres", "genres")
             add("vec_people", "people")
-            add("vec_text", "text")
+            add("vec_title", "title")
+            add("vec_summary", "summary")
             add("vec_year", "year")
+            add("vec_country", "country")
+            add("vec_rating", "rating")
+            add("vec_keywords", "keywords")
             return blocks
 
         def _block_slices(blocks):
@@ -318,7 +435,7 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
         if explain and blocks_slices:
             row_dense = X[picks_idx[ord_map[r.item_id]]].toarray().ravel()
             # per-block contributions
-            total = sc_map[r.item_id]
+            total = base_map[r.item_id]
             eps = 1e-12
             expl = {}
             for name, sl in blocks_slices:
@@ -326,8 +443,8 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
                 pct_contrib = (c / (total + eps)) * 100.0 if total > 0 else 0.0
                 expl[name] = {"contribution": round(c, 6), "percent_of_score": round(pct_contrib, 2)}
             if r.item_id in boosted_set:
-                base = sc_map[r.item_id]
-                total_after = base + REC_COLLECTION_BOOST
+                base = base_map[r.item_id]
+                total_after = sc_map[r.item_id]
                 pct_boost = (REC_COLLECTION_BOOST / max(total_after, 1e-12)) * 100.0
                 expl["collections_rerank_boost"] = {"contribution": REC_COLLECTION_BOOST, "percent_of_score": round(pct_boost, 2)}
             rec["explain"] = expl
@@ -336,8 +453,8 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
     if results:
         best = max(picks_scores) if picks_scores else float("nan")
         median = float(np.median(scores)) if scores.size else float("nan")
-        log.info("Recs for query=%r resolved uid=%s: candidates=%d topK=%d best_cos=%.4f median_cos=%.4f",
-                 user_query, uid, len(unwatched_idx), len(results), best, median)
+        log.info("Recs for query=%r resolved uid=%s: candidates=%d method=%s topK=%d best_cos=%.4f median_cos=%.4f",
+                 user_query, uid, len(candidate_idx), candidate_method, len(results), best, median)
     else:
         log.info("Recs for query=%r resolved uid=%s: no results", user_query, uid)
     return results

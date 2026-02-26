@@ -5,11 +5,13 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.preprocessing import normalize
 from joblib import dump, load
+from sklearn.neighbors import NearestNeighbors
 from .config import (ART_DIR, FEAT_W_GENRES, FEAT_W_PEOPLE, FEAT_W_COLLECTIONS, FEAT_W_YEAR, YEAR_BUCKET_SIZE, YEAR_MIN, YEAR_MAX, FEAT_W_TITLE, FEAT_W_SUMMARY, FEAT_W_COUNTRY, FEAT_W_RATING, FEAT_W_KEYWORDS)
 
 VEC_PATH = os.path.join(ART_DIR, "vectorizers.joblib")
 MAT_PATH = os.path.join(ART_DIR, "items_X.npz")
 IDX_PATH = os.path.join(ART_DIR, "items_index.csv")
+NN_PATH = os.path.join(ART_DIR, "items_nn_index.joblib")
 def _canonicalize_csv_field(series: pd.Series) -> pd.Series:
     """
     Normalize comma-separated string fields:
@@ -208,6 +210,12 @@ def build_item_matrix(items_df: pd.DataFrame):
 
     sp.save_npz(MAT_PATH, X)
     items_df[["item_id"]].astype(str).to_csv(IDX_PATH, index=False)
+
+    nn_index = None
+    if X.shape[0] > 0:
+        nn_index = NearestNeighbors(metric="cosine", algorithm="brute")
+        nn_index.fit(X)
+    dump({"nn_index": nn_index, "metric": "cosine"}, NN_PATH)
     return X
 
 
@@ -215,4 +223,8 @@ def load_artifacts():
     vecs = load(VEC_PATH)
     X = sp.load_npz(MAT_PATH)
     id_index = pd.read_csv(IDX_PATH, dtype={"item_id": str})["item_id"].astype(str).tolist()
-    return vecs, X, id_index
+
+    nn_artifact = None
+    if os.path.exists(NN_PATH):
+        nn_artifact = load(NN_PATH)
+    return vecs, X, id_index, nn_artifact

@@ -150,7 +150,7 @@ def debug_user(query: str):
     typer.echo(f"user_item_pref rows: {pref_cnt}")
 
     try:
-        _, X, id_index = load_artifacts()
+        _, X, id_index, _ = load_artifacts()
     except Exception as e:
         typer.echo(f"Artifacts not loaded: {e}")
         raise typer.Exit(1)

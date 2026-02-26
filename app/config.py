@@ -28,6 +28,9 @@ FEAT_W_YEAR        = float(os.getenv("FEAT_W_YEAR", "0.4"))
 
 REC_COLLECTION_BOOST     = float(os.getenv("REC_COLLECTION_BOOST", "0.25"))
 REC_COLLECTION_LOOKBACK  = int(os.getenv("REC_COLLECTION_LOOKBACK", "50"))
+REC_TWO_STAGE_THRESHOLD  = int(os.getenv("REC_TWO_STAGE_THRESHOLD", "5000"))
+REC_CANDIDATE_MULTIPLIER = int(os.getenv("REC_CANDIDATE_MULTIPLIER", "30"))
+REC_MIN_CANDIDATES       = int(os.getenv("REC_MIN_CANDIDATES", "500"))
 
 # year bucketing
 YEAR_BUCKET_SIZE   = int(os.getenv("YEAR_BUCKET_SIZE", "5"))
