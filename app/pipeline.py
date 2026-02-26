@@ -125,9 +125,11 @@ def ingest_once():
                 INSERT INTO watch_events(
                     user_id, user_name, item_id,
                     started_at, stopped_at,
-                    duration, view_offset, completed, source
+                    duration, view_offset, completed, source,
+                    plex_history_key
                 )
-                VALUES (:uid, :uname, :iid, :st, :sp, :dur, :off, 1, 'plex')
+                VALUES (:uid, :uname, :iid, :st, :sp, :dur, :off, 1, 'plex', :phk)
+                ON CONFLICT DO NOTHING
                 """,
                 {
                     "uid": uid,
@@ -137,6 +139,7 @@ def ingest_once():
                     "sp": stopped_iso,
                     "dur": row.get("duration") or 0,
                     "off": row.get("view_offset") or 0,
+                    "phk": row.get("history_key") or None,
                 },
             )
 

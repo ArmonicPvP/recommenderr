@@ -56,6 +56,7 @@ def iter_history():
             "stopped_at": v.get("@viewedAt"),
             "duration": int(v.get("@duration", 0)) // 1000 if v.get("@duration") else 0,
             "view_offset": int(v.get("@viewOffset", 0)) // 1000 if v.get("@viewOffset") else 0,
+            "history_key": str(v.get("@historyKey") or v.get("@key") or "").strip() or None,
         }
     log.info("History: %d rows after canonicalization", kept)
 
