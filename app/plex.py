@@ -1,9 +1,22 @@
 import logging
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 import xmltodict
 from .config import PLEX_BASE, PLEX_TOKEN
 
 log = logging.getLogger(__name__)
+
+
+def strip_plex_token(value: str | None) -> str | None:
+    """Strip X-Plex-Token from a Plex URL/path/query string value."""
+    if not value:
+        return value
+    parts = urlsplit(value)
+    if not parts.query:
+        return value
+    cleaned = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "X-Plex-Token"]
+    query = urlencode(cleaned, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 def _get(path: str, params=None) -> str:
     params = params or {}
@@ -97,7 +110,7 @@ def fetch_metadata(item_id: str):
     countries = csv_attr(node, "Country")
     content_rating = node.get("@contentRating")
     thumb = node.get("@thumb")
-    poster_url = f"{PLEX_BASE}{thumb}?X-Plex-Token={PLEX_TOKEN}" if thumb else None
+    poster_path = strip_plex_token(thumb) if thumb else None
     runtime = int(node.get("@duration", 0)) // 1000 if node.get("@duration") else None
     year = node.get("@year")
     year = int(year) if year and str(year).isdigit() else None
@@ -124,7 +137,7 @@ def fetch_metadata(item_id: str):
         "cast_csv": cast,
         "directors_csv": directors,
         "collections_csv": collections,
-        "poster_url": poster_url,
+        "poster_path": poster_path,
         "countries_csv": countries or "",
         "content_rating": content_rating or "",
         "tmdb_id": tmdb_id or ""

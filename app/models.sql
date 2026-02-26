@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS items(
   item_id TEXT PRIMARY KEY,
   type TEXT, title TEXT, year INTEGER, runtime INTEGER,
   summary TEXT, genres_csv TEXT, cast_csv TEXT,
-  directors_csv TEXT, collections_csv TEXT, poster_url TEXT
+  directors_csv TEXT, collections_csv TEXT, poster_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS watch_events(

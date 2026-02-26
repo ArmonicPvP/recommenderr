@@ -81,13 +81,14 @@ def recommend(
     k_opt: int = typer.Option(None, "--k", "-k", min=1, help="How many recommendations (option)"),
     output: str = typer.Option("text", "--output", "-o", help="text or json"),
     explain: bool = typer.Option(False, "--explain", help="Show feature-group contributions"),
+    include_auth_token: bool = typer.Option(False, "--include-auth-token", help="Emit transient signed poster URLs with X-Plex-Token"),
 ):
     """Print top-K recommendations for a user."""
     ensure_schema()
     k = k_opt if k_opt is not None else k_arg
 
     log.info("Recommend requested: query=%r k=%d fmt=%s explain=%s", username, k, output, explain)
-    recs = recommend_for_username(username, k=k, explain=explain)
+    recs = recommend_for_username(username, k=k, explain=explain, include_auth_token=include_auth_token)
 
     if not recs:
         log.warning("No recs available for query=%r", username)

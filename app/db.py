@@ -1,12 +1,17 @@
 import logging
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
-from pathlib import Path
+
 from .config import DB_PATH
+from .plex import strip_plex_token
 
 log = logging.getLogger(__name__)
 
 _engine: Engine | None = None
+
 
 def engine() -> Engine:
     global _engine
@@ -15,17 +20,31 @@ def engine() -> Engine:
         _engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
     return _engine
 
+
 def _column_exists(con, table: str, col: str) -> bool:
     rows = con.exec_driver_sql(f"PRAGMA table_info({table});").fetchall()
     cols = {r[1] for r in rows}
     return col in cols
+
+
+def _to_poster_path(value: str | None) -> str | None:
+    """Normalize legacy poster_url or thumb values into a token-free path/query string."""
+    if not value:
+        return value
+    cleaned = strip_plex_token(str(value))
+    if not cleaned:
+        return cleaned
+    parts = urlsplit(cleaned)
+    if parts.scheme or parts.netloc:
+        return urlunsplit(("", "", parts.path, parts.query, parts.fragment))
+    return cleaned
+
 
 def ensure_schema():
     """Create/upgrade schema, idempotent."""
     sql = Path(__file__).with_name("models.sql").read_text(encoding="utf-8")
     log.debug("Ensuring schema")
     with engine().begin() as con:
-        # Base DDL
         for stmt in sql.split(";"):
             s = stmt.strip()
             if s:
@@ -34,40 +53,59 @@ def ensure_schema():
                 except Exception:
                     pass
 
-        # Migrations handled here (not in models.sql):
         if not _column_exists(con, "users", "display_name"):
             log.info("Migrating: add users.display_name")
             con.exec_driver_sql("ALTER TABLE users ADD COLUMN display_name TEXT;")
 
-        # Allow multiple managed/guest entries with empty username
         try:
             con.exec_driver_sql("UPDATE users SET user_name = NULL WHERE user_name = ''")
         except Exception:
             pass
 
-        # feature columns on items (used by the vectorizer)
         item_migrations = [
+            ("poster_path", "ALTER TABLE items ADD COLUMN poster_path TEXT"),
             ("content_rating", "ALTER TABLE items ADD COLUMN content_rating TEXT"),
             ("countries_csv", "ALTER TABLE items ADD COLUMN countries_csv TEXT"),
-            ("keywords_csv",  "ALTER TABLE items ADD COLUMN keywords_csv TEXT"),
-            ("tmdb_id",       "ALTER TABLE items ADD COLUMN tmdb_id TEXT"),
+            ("keywords_csv", "ALTER TABLE items ADD COLUMN keywords_csv TEXT"),
+            ("tmdb_id", "ALTER TABLE items ADD COLUMN tmdb_id TEXT"),
         ]
         for col, ddl in item_migrations:
             if not _column_exists(con, "items", col):
                 log.info("Migrating: add items.%s", col)
                 con.exec_driver_sql(ddl)
 
-        # Helpful indexes (idempotent; ignore errors if present)
+        has_poster_path = _column_exists(con, "items", "poster_path")
+        has_poster_url = _column_exists(con, "items", "poster_url")
+        if has_poster_path:
+            rows = con.exec_driver_sql(
+                """
+                SELECT item_id, poster_path, poster_url
+                FROM items
+                WHERE COALESCE(poster_path, '') != '' OR COALESCE(poster_url, '') != ''
+                """
+            ).fetchall()
+            migrated = 0
+            for item_id, poster_path, poster_url in rows:
+                source = poster_path if (poster_path and str(poster_path).strip()) else poster_url
+                normalized = _to_poster_path(source)
+                if has_poster_url:
+                    con.exec_driver_sql(
+                        "UPDATE items SET poster_path=:pp, poster_url=NULL WHERE item_id=:iid",
+                        {"pp": normalized, "iid": str(item_id)},
+                    )
+                else:
+                    con.exec_driver_sql(
+                        "UPDATE items SET poster_path=:pp WHERE item_id=:iid",
+                        {"pp": normalized, "iid": str(item_id)},
+                    )
+                migrated += 1
+            if migrated:
+                log.info("Migrating: normalized %d items poster values into poster_path", migrated)
+
         try:
-            con.exec_driver_sql(
-                "CREATE INDEX IF NOT EXISTS idx_items_year ON items(year)"
-            )
-            con.exec_driver_sql(
-                "CREATE INDEX IF NOT EXISTS idx_items_tmdb ON items(tmdb_id)"
-            )
-            con.exec_driver_sql(
-                "CREATE INDEX IF NOT EXISTS idx_pref_user ON user_item_pref(user_id)"
-            )
+            con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_items_year ON items(year)")
+            con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_items_tmdb ON items(tmdb_id)")
+            con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_pref_user ON user_item_pref(user_id)")
         except Exception:
             pass
 
