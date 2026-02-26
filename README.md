@@ -96,3 +96,22 @@ YEAR_MAX=2030
 ---
 
 ##
+
+## 🗄️ SQLite maintenance for long-running installs
+
+Recommenderr configures SQLite with WAL mode, `synchronous=NORMAL`, and a `busy_timeout` to improve concurrent read/write behavior in container deployments. Over time, still plan for periodic maintenance:
+
+* **WAL checkpointing**: occasionally run `PRAGMA wal_checkpoint(TRUNCATE);` during low-activity windows if the `-wal` file grows unexpectedly.
+* **Vacuum policy**:
+  * Keep `auto_vacuum=INCREMENTAL` for long-lived deployments (set once, then `VACUUM` once to apply).
+  * Run `PRAGMA incremental_vacuum;` periodically (for example weekly/monthly) after large deletions.
+  * Run a full `VACUUM;` during maintenance windows if you need maximum file compaction.
+* **Analyze statistics**: after significant data growth, run `ANALYZE;` so SQLite can keep using the best indexes.
+
+Example maintenance commands:
+
+```sql
+PRAGMA wal_checkpoint(TRUNCATE);
+PRAGMA incremental_vacuum;
+ANALYZE;
+```

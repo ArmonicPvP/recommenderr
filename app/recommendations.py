@@ -134,7 +134,7 @@ def _user_rowvec(uid: str, X: sp.csr_matrix, id_index: list[str]) -> np.ndarray:
         dfp = pd.read_sql_query(
             """
             SELECT item_id, last_seen_at
-            FROM user_item_pref
+            FROM user_item_pref INDEXED BY idx_pref_user_seen_item
             WHERE user_id = :u
             ORDER BY last_seen_at DESC
             LIMIT 500
@@ -149,7 +149,7 @@ def _user_rowvec(uid: str, X: sp.csr_matrix, id_index: list[str]) -> np.ndarray:
         dfw = pd.read_sql_query(
             """
             SELECT item_id, MAX(started_at) AS last_seen_at
-            FROM watch_events
+            FROM watch_events INDEXED BY idx_we_user_item_started
             WHERE user_id = :u
             GROUP BY item_id
             ORDER BY last_seen_at DESC
@@ -171,7 +171,7 @@ def _recent_user_collections(user_id: str, lookback: int) -> set[str]:
         df = pd.read_sql_query(
             """
             SELECT p.item_id, i.collections_csv
-            FROM user_item_pref p
+            FROM user_item_pref p INDEXED BY idx_pref_user_seen_item
             JOIN items i ON i.item_id = p.item_id
             WHERE p.user_id=:u
             ORDER BY p.last_seen_at DESC
@@ -199,7 +199,7 @@ def recommend_for_username(user_query: str, k: int = 10, explain: bool = False):
 
     with engine().begin() as con:
         df_w = pd.read_sql_query(
-            "SELECT DISTINCT item_id FROM watch_events WHERE user_id=:u",
+            "SELECT item_id FROM watch_events WHERE user_id=:u GROUP BY item_id",
             con, params={"u": uid}
         )
         watched = set(df_w["item_id"].astype(str).tolist())

@@ -15,11 +15,13 @@ CREATE TABLE IF NOT EXISTS watch_events(
   source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_we_user_time ON watch_events(user_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_we_user_item_started ON watch_events(user_id, item_id, started_at DESC);
 
 CREATE TABLE IF NOT EXISTS user_item_pref(
   user_id TEXT, item_id TEXT, preference REAL, last_seen_at TEXT,
   PRIMARY KEY (user_id, item_id)
 );
+CREATE INDEX IF NOT EXISTS idx_pref_user_seen_item ON user_item_pref(user_id, last_seen_at DESC, item_id);
 
 CREATE TABLE IF NOT EXISTS users(
   user_id TEXT PRIMARY KEY,
@@ -27,3 +29,4 @@ CREATE TABLE IF NOT EXISTS users(
   display_name TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(user_name);
+CREATE INDEX IF NOT EXISTS idx_items_item_id ON items(item_id);

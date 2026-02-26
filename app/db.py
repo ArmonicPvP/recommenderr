@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from pathlib import Path
 from .config import DB_PATH
@@ -13,6 +13,17 @@ def engine() -> Engine:
     if _engine is None:
         log.info("Initializing SQLite engine at %s", DB_PATH)
         _engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
+
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_conn, _conn_record):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL;")
+            cur.execute("PRAGMA synchronous=NORMAL;")
+            cur.execute("PRAGMA busy_timeout=5000;")
+            # Container-friendly cache/temp settings to reduce fs churn.
+            cur.execute("PRAGMA temp_store=MEMORY;")
+            cur.execute("PRAGMA cache_size=-20000;")
+            cur.close()
     return _engine
 
 def _column_exists(con, table: str, col: str) -> bool:
@@ -67,6 +78,12 @@ def ensure_schema():
             )
             con.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS idx_pref_user ON user_item_pref(user_id)"
+            )
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_we_user_item_started ON watch_events(user_id, item_id, started_at DESC)"
+            )
+            con.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS idx_pref_user_seen_item ON user_item_pref(user_id, last_seen_at DESC, item_id)"
             )
         except Exception:
             pass
