@@ -27,6 +27,11 @@ def _column_exists(con, table: str, col: str) -> bool:
     return col in cols
 
 
+def _index_exists(con, name: str) -> bool:
+    rows = con.exec_driver_sql("PRAGMA index_list(watch_events);").fetchall()
+    return any(r[1] == name for r in rows)
+
+
 def _to_poster_path(value: str | None) -> str | None:
     """Normalize legacy poster_url or thumb values into a token-free path/query string."""
     if not value:
@@ -101,6 +106,60 @@ def ensure_schema():
                 migrated += 1
             if migrated:
                 log.info("Migrating: normalized %d items poster values into poster_path", migrated)
+
+        if not _column_exists(con, "watch_events", "plex_history_key"):
+            log.info("Migrating: add watch_events.plex_history_key")
+            con.exec_driver_sql("ALTER TABLE watch_events ADD COLUMN plex_history_key TEXT")
+
+        if not _index_exists(con, "uix_we_source_plex_history_key"):
+            log.info("Migrating: create watch_events canonical key unique index")
+            con.exec_driver_sql(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uix_we_source_plex_history_key
+                ON watch_events(source, plex_history_key)
+                WHERE plex_history_key IS NOT NULL
+                """
+            )
+
+        if not _index_exists(con, "uix_we_fallback"):
+            log.info("Migrating: dedupe legacy watch_events and create fallback unique index")
+            deleted = con.exec_driver_sql(
+                """
+                WITH ranked AS (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                             PARTITION BY user_id, item_id, started_at, source
+                             ORDER BY id
+                           ) AS rn
+                    FROM watch_events
+                    WHERE plex_history_key IS NULL
+                )
+                DELETE FROM watch_events
+                WHERE id IN (SELECT id FROM ranked WHERE rn > 1)
+                """
+            ).rowcount
+            log.info("Migrating: removed %d duplicate watch_events rows", deleted or 0)
+            con.exec_driver_sql(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uix_we_fallback
+                ON watch_events(user_id, item_id, started_at, source)
+                WHERE plex_history_key IS NULL
+                """
+            )
+            con.exec_driver_sql("DELETE FROM user_item_pref")
+            con.exec_driver_sql(
+                """
+                INSERT INTO user_item_pref(user_id,item_id,preference,last_seen_at)
+                SELECT
+                    user_id,
+                    item_id,
+                    CAST(COUNT(*) AS REAL) AS preference,
+                    MAX(started_at) AS last_seen_at
+                FROM watch_events
+                GROUP BY user_id, item_id
+                """
+            )
+            log.info("Migrating: rebuilt user_item_pref from deduplicated watch_events")
 
         try:
             con.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_items_year ON items(year)")

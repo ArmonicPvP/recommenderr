@@ -135,6 +135,7 @@ def ingest_once():
                     "uid": uid,
                     "uname": friendly,
                     "iid": item_id,
+                    "phk": row.get("plex_history_key"),
                     "st": started_iso,
                     "sp": stopped_iso,
                     "dur": row.get("duration") or 0,
@@ -151,11 +152,12 @@ def ingest_once():
             con.exec_driver_sql(
                 """
                 INSERT INTO watch_events(
-                    user_id, user_name, item_id,
+                    user_id, user_name, item_id, plex_history_key,
                     started_at, stopped_at,
                     duration, view_offset, completed, source
                 )
-                VALUES (:uid, :uname, :iid, :st, :sp, :dur, :off, 1, 'plex')
+                VALUES (:uid, :uname, :iid, :phk, :st, :sp, :dur, :off, 1, 'plex')
+                ON CONFLICT DO NOTHING
                 """,
                 event,
             )

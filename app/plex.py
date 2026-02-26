@@ -35,6 +35,26 @@ def _extract_id_from_keypath(path: str | None) -> str | None:
         return tail.split("?", 1)[0].strip("/ ")
     return None
 
+def _stable_history_key(video: dict, canonical_item_id: str | None) -> str | None:
+    """Return a stable key for a Plex history event, preferring native identifiers."""
+    native = (
+        video.get("@historyKey")
+        or video.get("@historyID")
+        or video.get("@viewHistoryKey")
+        or video.get("@playHistoryID")
+        or video.get("@guid")
+    )
+    if native:
+        return str(native)
+
+    account = str(video.get("@accountID") or "")
+    viewed_at = str(video.get("@viewedAt") or video.get("@addedAt") or "")
+    source = "plex"
+    if canonical_item_id and account and viewed_at:
+        return f"{account}:{canonical_item_id}:{viewed_at}:{source}"
+    return None
+
+
 def iter_history():
     """Yield canonicalized watch events (episodes → series id; movies unchanged)."""
     xml = _get("/status/sessions/history/all")
@@ -63,6 +83,7 @@ def iter_history():
             "user_id": str(v.get("@accountID") or ""),
             "user_name": None,
             "item_id": canonical_id,
+            "plex_history_key": _stable_history_key(v, canonical_id),
             "type": "show" if media_type == "episode" else media_type,
             "title": v.get("@title"),
             "started_at": v.get("@viewedAt") or v.get("@addedAt"),
