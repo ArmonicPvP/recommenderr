@@ -80,6 +80,19 @@ See `.env.example` for defaults.
 | `LOG_LEVEL`         | `INFO`                     | `DEBUG` for more detail                     |
 | `LOG_FILE`          | `/data/recommenderr.log`   | Rotating log file                           |
 
+### Docker runtime user and `/data` permissions
+
+The container creates and runs as an unprivileged `appuser` by default.
+
+- Username: `appuser`
+- UID: `10001` (override with build arg `APP_UID`)
+- GID: `10001` (override with build arg `APP_GID`)
+
+The application needs write access to `/data` for SQLite, logs, and artifacts.
+When using bind mounts, ensure the host directory is writable by the same UID/GID
+(or adjust ownership/ACLs accordingly).
+
+
 **Feature weights:**
 
 ```
